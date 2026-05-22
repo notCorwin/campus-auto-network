@@ -6,8 +6,7 @@
     <string>com.nowaywastaken.csustautologin</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/python3</string>
-        <string>/Users/nowaywastaken/CsustNetAutoLogin/main.py</string>
+        <string>/Users/nowaywastaken/CsustNetAutoLogin/target/release/csust-auto-login</string>
     </array>
     <key>WatchPaths</key>
     <array>
