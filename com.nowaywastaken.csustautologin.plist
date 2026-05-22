@@ -8,11 +8,13 @@
     <array>
         <string>/Users/nowaywastaken/CsustNetAutoLogin/target/release/csust-auto-login</string>
     </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>30</integer>
     <key>WatchPaths</key>
     <array>
         <string>/Library/Preferences/SystemConfiguration</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
 </dict>
 </plist>

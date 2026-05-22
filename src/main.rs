@@ -225,6 +225,11 @@ fn main() {
         return;
     }
 
+    // 连通性检测：如果能上网就不再执行登录
+    if can_reach_internet() {
+        return;
+    }
+
     // 获取密码
     let password = match PASSWORD {
         Some(pw) => pw.to_string(),
@@ -320,4 +325,43 @@ fn main() {
             );
         }
     }
+}
+
+// --------------- 连通性检测 ---------------
+
+/// 检查能否连通外网（204 探针方式）
+fn can_reach_internet() -> bool {
+    let probes = [
+        "http://connect.rom.miui.com/generate_204",
+        "http://www.gstatic.com/generate_204",
+        "http://captive.apple.com/hotspot-detect.html",
+    ];
+    for url in &probes {
+        match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
+            .build()
+        {
+            Ok(client) => match client.get(*url).send() {
+                Ok(resp) => {
+                    // 204 No Content = 确认在线
+                    if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                        return true;
+                    }
+                    // Apple captive 探针，在线时返回 200 + "Success"
+                    if resp.status().is_success() {
+                        if let Ok(body) = resp.text() {
+                            if body.contains("Success") {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        }
+    }
+    false
 }
