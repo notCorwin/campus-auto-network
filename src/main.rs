@@ -5,7 +5,6 @@
 //! - 自动检测 SSID 是否为目标校园网
 //! - 自动检测本机 IP
 //! - 通过 GET 请求完成 eportal 认证
-//! - Cookie 持久化
 //! - 日志记录与自动清理
 //! - macOS 原生通知
 
@@ -14,15 +13,11 @@ mod config;
 use chrono::Local;
 use config::*;
 use reqwest::blocking::Client;
-use reqwest::cookie::Jar;
-
-use serde_json::json;
 use std::fs;
 use std::io::{self, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 // --------------- 工具函数 ---------------
@@ -149,11 +144,6 @@ fn project_dir() -> PathBuf {
     }
 }
 
-/// Cookie 文件路径
-fn cookies_path() -> PathBuf {
-    project_dir().join("csust_session_cookies.json")
-}
-
 /// 写入权限检测
 fn check_writable() -> Result<(), String> {
     let test_path = project_dir().join(".write_test");
@@ -161,40 +151,6 @@ fn check_writable() -> Result<(), String> {
         .map_err(|e| format!("当前目录缺少写入权限：{:?}\n{}", project_dir(), e))?;
     let _ = fs::remove_file(&test_path);
     Ok(())
-}
-
-// --------------- Cookie 管理 ---------------
-
-/// 从 JSON 文件加载 Cookie，构建 Cookie Jar
-fn load_cookie_jar() -> Arc<Jar> {
-    let jar = Arc::new(Jar::default());
-    let path = cookies_path();
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&content) {
-                for (name, value) in &map {
-                    let cookie_str = format!("{}={}; Domain={}; Path=/", name, value, HOST);
-                    let url_str = format!("{}://{}:{}", SCHEME, HOST, PORT);
-                    if let Ok(url) = url_str.parse::<reqwest::Url>() {
-                        jar.add_cookie_str(&cookie_str, &url);
-                    }
-                }
-            }
-        }
-    }
-    jar
-}
-
-/// 保存 Cookie 到 JSON 文件（从 Cookie Jar 中提取）
-fn save_cookies(_client: &Client) {
-    // reqwest 的 cookie jar 没有直接遍历的方法，
-    // 我们通过存储最新的登录响应中的信息来间接处理。
-    // 实际上对于这个登录流程，cookie 不是关键数据；
-    // 这里保留一个占位文件表明已登录过。
-    let placeholder = json!({
-        "_last_login": Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-    });
-    let _ = fs::write(cookies_path(), serde_json::to_string_pretty(&placeholder).unwrap());
 }
 
 // --------------- 登录逻辑 ---------------
@@ -306,11 +262,7 @@ fn main() {
     };
 
     // 构造 HTTP 客户端
-    let cookie_jar = load_cookie_jar();
-
     let client: Client = Client::builder()
-        .cookie_store(true)
-        .cookie_provider(cookie_jar)
         .danger_accept_invalid_certs(!VERIFY_SSL)
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36")
@@ -335,7 +287,7 @@ fn main() {
         .send()
     {
         Ok(resp) => {
-            let text: String = resp.text().unwrap_or_default();
+            let text = resp.text().unwrap_or_default();
 
             // 保存日志
             let log_content = format!(
@@ -349,7 +301,6 @@ fn main() {
 
             // 判断登录结果
             if is_login_successful(&text) {
-                save_cookies(&client);
                 println!("登录成功或已在线。");
             } else if is_login_failed(&text) {
                 show_alert("登录失败: 账号密码有误或登录参数失效。", "登录失败");
@@ -357,7 +308,7 @@ fn main() {
                 let preview = if text.len() > 200 {
                     format!("{}...", &text[..200])
                 } else {
-                    text.clone()
+                    text.to_string()
                 };
                 show_alert(&format!("无法确定登录结果。服务器返回：\n{}", preview), "状态未知");
             }

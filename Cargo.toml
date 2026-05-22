@@ -5,7 +5,6 @@ edition = "2021"
 description = "CSUST eportal 校园网自动登录工具（Rust 重写版）"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["native-tls", "cookies", "blocking"] }
-serde_json = "1.0"
+reqwest = { version = "0.12", features = ["native-tls", "blocking"] }
 chrono = "0.4"
 tokio = { version = "1", features = ["full"] }
