@@ -1,0 +1,4 @@
+Request URL: https://login.csust.edu.cn:802/eportal/portal/login?callback=dr1003&login_method=1&user_account=,0,202401150107&user_password=tdVrB%21D8mjmqvdcH&wlan_user_ip=10.161.166.37&wlan_user_ipv6=&wlan_user_mac=000000000000&wlan_ac_ip=&wlan_ac_name=&jsVersion=4.2.1&terminal_type=1&lang=zh-cn&v=8207
+Params: callback=dr1003&login_method=1&user_account=,0,202401150107&user_password=tdVrB%21D8mjmqvdcH&wlan_user_ip=10.161.166.37&wlan_user_ipv6=&wlan_user_mac=000000000000&wlan_ac_ip=&wlan_ac_name=&jsVersion=4.2.1&terminal_type=1&lang=zh-cn&v=8207
+----------------------------------------
+dr1003({"result":1,"msg":"Portal协议认证成功！"});
