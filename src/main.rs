@@ -198,47 +198,34 @@ fn is_login_failed(text: &str) -> bool {
 
 // --------------- 登录执行（单次尝试） ---------------
 
-/// 执行单次登录尝试，返回 Some(true) 表示已处理完毕（成功/已在线/失败），None 表示需要重试
-fn try_login(attempt: u32) -> Option<bool> {
-    // WiFi / 网络环境检测
-    let current_ssid = get_current_ssid();
+/// 执行单次登录尝试，返回 true 表示已连上网（成功/已在线），false 表示需要重试
+fn try_login(on_target_ssid: bool) -> bool {
+    // 检测本机 IP
     let detected_ip = detect_local_ip();
 
-    // SSID 匹配（不分大小写）
-    let ssid_match = current_ssid
-        .as_ref()
-        .map(|s| s.to_lowercase() == TARGET_SSID.to_lowercase())
-        .unwrap_or(false);
-
-    // IP 段匹配 (10.161.*)
+    // IP 段匹配 (10.161.*) —— 非目标 SSID 时用于判断是否在校园网环境
     let ip_match = detected_ip
         .as_ref()
         .map(|ip| ip.starts_with("10.161."))
         .unwrap_or(false);
 
-    if !ssid_match && !ip_match {
-        if attempt < RETRY_ATTEMPTS {
-            // IP 尚未分配到校园网段，稍后重试
-            return None;
-        }
-        // 所有重试耗尽，静默退出
-        return Some(true);
+    // 既不是目标 SSID 也不是校园网 IP 段 → 环境不匹配，无需重试
+    if !on_target_ssid && !ip_match {
+        return true;
     }
 
     // 连通性检测：如果能上网就不再执行登录
     if can_reach_internet() {
-        return Some(true);
+        return true;
     }
 
     // 获取密码
     let password = match PASSWORD {
         Some(pw) => pw.to_string(),
         None => {
-            // 从环境变量读取
             match std::env::var("CSUST_PASSWORD") {
                 Ok(pw) => pw,
                 Err(_) => {
-                    // 交互式输入
                     print!("Password: ");
                     let _ = io::stdout().flush();
                     let mut pw = String::new();
@@ -253,17 +240,13 @@ fn try_login(attempt: u32) -> Option<bool> {
         }
     };
 
-    // 自动检测 IP
+    // 自动检测 IP（每次重试重新检测，因为 IP 可能变化）
     let wlan_ip = if AUTO_DETECT_IP {
-        match &detected_ip {
-            Some(ip) => ip.clone(),
+        match detect_local_ip() {
+            Some(ip) => ip,
             None => {
-                if attempt < RETRY_ATTEMPTS {
-                    // IP 尚未就绪，稍后重试
-                    return None;
-                }
-                show_alert("自动检测 IP 失败，无法进行登录。", "检测失败");
-                return Some(true);
+                // IP 尚未就绪，重试
+                return false;
             }
         }
     } else {
@@ -311,7 +294,9 @@ fn try_login(attempt: u32) -> Option<bool> {
             // 判断登录结果
             if is_login_successful(&text) {
                 println!("登录成功或已在线。");
-            } else if is_login_failed(&text) {
+                return true;
+            }
+            if is_login_failed(&text) {
                 show_alert("登录失败: 账号密码有误或登录参数失效。", "登录失败");
             } else {
                 let preview = if text.len() > 200 {
@@ -321,16 +306,19 @@ fn try_login(attempt: u32) -> Option<bool> {
                 };
                 show_alert(&format!("无法确定登录结果。服务器返回：\n{}", preview), "状态未知");
             }
+
+            // 登录失败，需要重试
+            false
         }
         Err(e) => {
             show_alert(
                 &format!("网络连接失败: {e:?}\n\n(提示: 请检查是否连上了校园网 WiFi)"),
                 "网络异常",
             );
+            // 网络异常，重试
+            false
         }
     }
-
-    Some(true)
 }
 
 // --------------- 主流程 ---------------
@@ -348,13 +336,28 @@ fn main() {
     // 启动时立即清理旧日志
     cleanup_old_logs(&project_dir().join("logs"), LOG_MAX_AGE_HOURS);
 
-    // 添加内部重试，应对网络栈尚未就绪的情况
-    for attempt in 1..=RETRY_ATTEMPTS as usize {
+    // 检测 SSID，判断是否在目标校园网下
+    let current_ssid = get_current_ssid();
+    let on_target_ssid = current_ssid
+        .as_ref()
+        .map(|s| s.to_lowercase() == TARGET_SSID.to_lowercase())
+        .unwrap_or(false);
+
+    // 如果不是目标 SSID，尝试有限次数后退出
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+
+        if !on_target_ssid && attempt > RETRY_ATTEMPTS {
+            // 非目标 SSID 有限重试耗尽，静默退出
+            return;
+        }
+
         if attempt > 1 {
             std::thread::sleep(Duration::from_secs(RETRY_INTERVAL_SECS));
         }
 
-        if try_login(attempt as u32).is_some() {
+        if try_login(on_target_ssid) {
             return;
         }
     }
