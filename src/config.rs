@@ -27,3 +27,7 @@ pub const TIMEOUT_SECS: u64 = 15;
 pub const LOG_MAX_AGE_HOURS: f64 = 0.25;
 /// 启动后等待秒数（等待网络栈稳定）
 pub const STARTUP_DELAY_SECS: u64 = 2;
+/// 内部重试次数（launchd 每 15 秒启动一次程序，内部重试可覆盖短时网络波动）
+pub const RETRY_ATTEMPTS: u32 = 3;
+/// 内部重试间隔（秒）
+pub const RETRY_INTERVAL_SECS: u64 = 5;

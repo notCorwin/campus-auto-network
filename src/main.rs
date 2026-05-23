@@ -186,29 +186,20 @@ fn is_login_successful(text: &str) -> bool {
         || text.contains("成功")
         || text.to_lowercase().contains("online")
         || text.contains("已经在线")
-        || text.contains("认证超时")
+        || text.contains("认证成功")
 }
 
 /// 检查登录响应是否表示密码错误
 fn is_login_failed(text: &str) -> bool {
-    text.contains("Dr.COMWebLoginID_2.htm") || text.contains("密码错误")
+    text.contains("Dr.COMWebLoginID_2.htm")
+        || text.contains("密码错误")
+        || text.contains("认证超时")
 }
 
-// --------------- 主流程 ---------------
+// --------------- 登录执行（单次尝试） ---------------
 
-fn main() {
-    // 启动延时，等待网络栈稳定
-    std::thread::sleep(Duration::from_secs(STARTUP_DELAY_SECS));
-
-    // 写入权限检测
-    if let Err(msg) = check_writable() {
-        show_alert(&msg, "权限错误");
-        std::process::exit(1);
-    }
-
-    // 启动时立即清理旧日志
-    cleanup_old_logs(&project_dir().join("logs"), LOG_MAX_AGE_HOURS);
-
+/// 执行单次登录尝试，返回 Some(true) 表示已处理完毕（成功/已在线/失败），None 表示需要重试
+fn try_login(attempt: u32) -> Option<bool> {
     // WiFi / 网络环境检测
     let current_ssid = get_current_ssid();
     let detected_ip = detect_local_ip();
@@ -226,13 +217,17 @@ fn main() {
         .unwrap_or(false);
 
     if !ssid_match && !ip_match {
-        // 环境不匹配，静默退出
-        return;
+        if attempt < RETRY_ATTEMPTS {
+            // IP 尚未分配到校园网段，稍后重试
+            return None;
+        }
+        // 所有重试耗尽，静默退出
+        return Some(true);
     }
 
     // 连通性检测：如果能上网就不再执行登录
     if can_reach_internet() {
-        return;
+        return Some(true);
     }
 
     // 获取密码
@@ -260,11 +255,15 @@ fn main() {
 
     // 自动检测 IP
     let wlan_ip = if AUTO_DETECT_IP {
-        match detected_ip {
-            Some(ip) => ip,
+        match &detected_ip {
+            Some(ip) => ip.clone(),
             None => {
+                if attempt < RETRY_ATTEMPTS {
+                    // IP 尚未就绪，稍后重试
+                    return None;
+                }
                 show_alert("自动检测 IP 失败，无法进行登录。", "检测失败");
-                return;
+                return Some(true);
             }
         }
     } else {
@@ -328,6 +327,35 @@ fn main() {
                 &format!("网络连接失败: {e:?}\n\n(提示: 请检查是否连上了校园网 WiFi)"),
                 "网络异常",
             );
+        }
+    }
+
+    Some(true)
+}
+
+// --------------- 主流程 ---------------
+
+fn main() {
+    // 启动延时，等待网络栈稳定
+    std::thread::sleep(Duration::from_secs(STARTUP_DELAY_SECS));
+
+    // 写入权限检测
+    if let Err(msg) = check_writable() {
+        show_alert(&msg, "权限错误");
+        std::process::exit(1);
+    }
+
+    // 启动时立即清理旧日志
+    cleanup_old_logs(&project_dir().join("logs"), LOG_MAX_AGE_HOURS);
+
+    // 添加内部重试，应对网络栈尚未就绪的情况
+    for attempt in 1..=RETRY_ATTEMPTS as usize {
+        if attempt > 1 {
+            std::thread::sleep(Duration::from_secs(RETRY_INTERVAL_SECS));
+        }
+
+        if try_login(attempt as u32).is_some() {
+            return;
         }
     }
 }

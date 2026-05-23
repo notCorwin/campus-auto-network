@@ -12,9 +12,5 @@
     <true/>
     <key>StartInterval</key>
     <integer>15</integer>
-    <key>WatchPaths</key>
-    <array>
-        <string>/Library/Preferences/SystemConfiguration</string>
-    </array>
 </dict>
 </plist>
