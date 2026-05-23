@@ -135,10 +135,15 @@ fn detect_local_ip() -> Option<String> {
 fn project_dir() -> PathBuf {
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from("."));
-    // 如果是 cargo run 或 debug 构建，回退到当前目录
     let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
     if dir.ends_with("target/debug") || dir.ends_with("target/release") {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        // target/{debug,release} -> 向上两级到项目根目录
+        dir.parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            })
     } else {
         dir
     }
