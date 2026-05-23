@@ -93,7 +93,8 @@ fn get_current_ssid() -> Option<String> {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
-                    if let Some(val) = line.strip_prefix("SSID : ") {
+                    let trimmed = line.trim();
+                    if let Some(val) = trimmed.strip_prefix("SSID : ") {
                         let ssid = val.trim().to_string();
                         if !ssid.is_empty() {
                             return Some(ssid);
