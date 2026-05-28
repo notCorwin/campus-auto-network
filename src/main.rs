@@ -134,17 +134,17 @@ fn detect_local_ip() -> Option<String> {
 
 /// 项目根目录
 fn project_dir() -> PathBuf {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let dir = exe
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     if dir.ends_with("target/debug") || dir.ends_with("target/release") {
         // target/{debug,release} -> 向上两级到项目根目录
         dir.parent()
             .and_then(|p| p.parent())
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     } else {
         dir
     }
@@ -162,7 +162,11 @@ fn check_writable() -> Result<(), String> {
 // --------------- 登录逻辑 ---------------
 
 /// 构建登录参数
-fn build_params<'a>(username: &'a str, password: &'a str, wlan_ip: &'a str) -> Vec<(&'a str, String)> {
+fn build_params<'a>(
+    username: &'a str,
+    password: &'a str,
+    wlan_ip: &'a str,
+) -> Vec<(&'a str, String)> {
     let user_account = format!(",0,{}", username);
     vec![
         ("callback", "dr1003".to_string()),
@@ -223,22 +227,20 @@ fn try_login(on_target_ssid: bool) -> bool {
     // 获取密码
     let password = match PASSWORD {
         Some(pw) => pw.to_string(),
-        None => {
-            match std::env::var("CSUST_PASSWORD") {
-                Ok(pw) => pw,
-                Err(_) => {
-                    print!("Password: ");
-                    let _ = io::stdout().flush();
-                    let mut pw = String::new();
-                    if io::stdin().read_line(&mut pw).is_ok() {
-                        pw.trim().to_string()
-                    } else {
-                        show_alert("无法读取密码输入。", "配置错误");
-                        std::process::exit(2);
-                    }
+        None => match std::env::var("CSUST_PASSWORD") {
+            Ok(pw) => pw,
+            Err(_) => {
+                print!("Password: ");
+                let _ = io::stdout().flush();
+                let mut pw = String::new();
+                if io::stdin().read_line(&mut pw).is_ok() {
+                    pw.trim().to_string()
+                } else {
+                    show_alert("无法读取密码输入。", "配置错误");
+                    std::process::exit(2);
                 }
             }
-        }
+        },
     };
 
     // 自动检测 IP（每次重试重新检测，因为 IP 可能变化）
@@ -305,15 +307,23 @@ fn try_login(on_target_ssid: bool) -> bool {
                 } else {
                     text.to_string()
                 };
-                show_alert(&format!("无法确定登录结果。服务器返回：\n{}", preview), "状态未知");
+                show_alert(
+                    &format!("无法确定登录结果。服务器返回：\n{}", preview),
+                    "状态未知",
+                );
             }
 
             // 登录失败，需要重试
             false
         }
         Err(e) => {
+            let err_msg = format!(
+                "网络连接失败: {e:?}\nURL: {}\nDetected IP: {}",
+                url, wlan_ip
+            );
+            log_to_file(&err_msg, "ERR");
             show_alert(
-                &format!("网络连接失败: {e:?}\n\n(提示: 请检查是否连上了校园网 WiFi)"),
+                &format!("{}\n\n(提示: 请检查是否连上了校园网 WiFi)", err_msg),
                 "网络异常",
             );
             // 网络异常，重试
