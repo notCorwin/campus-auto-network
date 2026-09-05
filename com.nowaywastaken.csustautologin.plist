@@ -5,16 +5,16 @@
     <key>Label</key>
     <string>com.nowaywastaken.csustautologin</string>
     <key>Program</key>
-    <string>INSTALLER_SETS_BINARY_PATH</string>
+    <string>INSTALLER_SETS_MONITOR_PATH</string>
     <key>ProgramArguments</key>
     <array>
-        <string>csust-auto-login</string>
-        <string>run</string>
+        <string>INSTALLER_SETS_MONITOR_PATH</string>
+        <string>INSTALLER_SETS_BINARY_PATH</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <key>StartInterval</key>
-    <integer>15</integer>
+    <key>KeepAlive</key>
+    <true/>
     <key>ProcessType</key>
     <string>Background</string>
     <key>Umask</key>

@@ -45,7 +45,7 @@ fn network(interface: &str, ssid: Option<&str>, ip: Option<&str>) -> Network {
 }
 
 fn campus() -> Vec<Network> {
-    vec![network("en0", None, Some("10.183.0.2"))]
+    vec![network("en0", Some("CSUST-Student"), Some("10.183.0.2"))]
 }
 
 // stdlib 本地 HTTP 服务；每次等待均有截止时间，失败测试不会永久挂起。
@@ -118,6 +118,8 @@ fn closed_url() -> String {
 
 #[test]
 fn ssid_network_and_response_regressions() {
+    let hardware = "Hardware Port: Ethernet Adapter (en3)\nDevice: en3\n\nHardware Port: Wi-Fi\nDevice: en0\n\nHardware Port: AirPort\nDevice: en1";
+    assert_eq!(parse_wifi_interface_blocks(hardware), vec!["en0", "en1"]);
     for line in [
         "SSID : CSUST-Student",
         "  SSID:   CSUST-Student  ",
@@ -137,7 +139,7 @@ fn ssid_network_and_response_regressions() {
     let candidates = vec![
         network("en0", Some("Personal Hotspot"), Some("172.20.10.4")),
         network("utun4", None, Some("10.161.0.1")),
-        network("en3", None, Some("10.183.0.2")),
+        network("en3", Some("CSUST-Student"), Some("10.183.0.2")),
     ];
     assert_eq!(
         select_network(&config, &candidates).unwrap().interface,
@@ -145,7 +147,11 @@ fn ssid_network_and_response_regressions() {
     );
     assert!(select_network(&config, &candidates[..2]).is_none());
     let pending = network("en0", Some("csust-student"), None);
+    assert!(select_network(&config, &[pending]).is_none());
+    let pending = network("en0", Some("CSUST-Student"), None);
     assert!(select_network(&config, &[pending]).unwrap().ip.is_none());
+    let wrong_ip = network("en0", Some("CSUST-Student"), Some("192.168.1.2"));
+    assert!(select_network(&config, &[wrong_ip]).is_none());
     for ip in [
         "198.18.0.1",
         "198.19.255.1",

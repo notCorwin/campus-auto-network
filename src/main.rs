@@ -35,6 +35,21 @@ fn parse_ssid_line(line: &str) -> Option<String> {
     .then(|| value.to_owned())
 }
 
+fn parse_wifi_interface_blocks(text: &str) -> Vec<String> {
+    let mut is_wifi = false;
+    let mut interfaces = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(port) = line.strip_prefix("Hardware Port: ") {
+            is_wifi = matches!(port, "Wi-Fi" | "AirPort");
+        } else if is_wifi {
+            if let Some(device) = line.strip_prefix("Device: ") {
+                interfaces.push(device.to_owned());
+            }
+        }
+    }
+    interfaces
+}
+
 fn usable_ip(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     !(ip.is_loopback()
@@ -66,23 +81,9 @@ impl Network {
 fn scan_networks() -> Vec<Network> {
     let hardware =
         command("/usr/sbin/networksetup", &["-listallhardwareports"]).unwrap_or_default();
-    let mut interfaces: Vec<String> = hardware
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("Device: ").map(str::to_owned))
-        .collect();
-    if interfaces.is_empty() {
-        interfaces = command("/sbin/ifconfig", &["-l"])
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-    }
+    let interfaces = parse_wifi_interface_blocks(&hardware);
     interfaces
         .into_iter()
-        .filter(|name| {
-            name.strip_prefix("en")
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        })
         .map(|interface| {
             let summary =
                 command("/usr/sbin/ipconfig", &["getsummary", &interface]).unwrap_or_default();
@@ -105,39 +106,26 @@ fn scan_networks() -> Vec<Network> {
         .collect()
 }
 
+fn campus_ip(config: &Config, ip: Ipv4Addr) -> bool {
+    usable_ip(ip)
+        && config
+            .ip_prefixes
+            .iter()
+            .any(|prefix| ip.to_string().starts_with(prefix))
+}
+
 fn select_network(config: &Config, networks: &[Network]) -> Option<Network> {
-    let campus_ip = |network: &&Network| {
-        network.ip.is_some_and(|ip| {
-            usable_ip(ip)
-                && config
-                    .ip_prefixes
-                    .iter()
-                    .any(|prefix| ip.to_string().starts_with(prefix))
-        })
-    };
     let target_ssid = |network: &&Network| {
         network
             .ssid
             .as_deref()
-            .is_some_and(|ssid| ssid.eq_ignore_ascii_case(&config.ssid))
+            .is_some_and(|ssid| ssid == config.ssid)
     };
     networks
         .iter()
-        .filter(|n| n.interface.starts_with("en"))
-        .find(campus_ip)
-        .or_else(|| {
-            networks
-                .iter()
-                .filter(|n| n.interface.starts_with("en"))
-                .filter(target_ssid)
-                .find(|n| n.ip.is_some_and(usable_ip))
-        })
-        .or_else(|| {
-            networks
-                .iter()
-                .filter(|n| n.interface.starts_with("en"))
-                .find(target_ssid)
-        })
+        .filter(target_ssid)
+        .find(|network| network.ip.is_some_and(|ip| campus_ip(config, ip)))
+        .or_else(|| networks.iter().filter(target_ssid).find(|n| n.ip.is_none()))
         .cloned()
 }
 
@@ -294,6 +282,9 @@ fn login(
             .send();
         match response {
             Ok(response) => {
+                if !still_connected() {
+                    return (Outcome::NetworkChanged, last_route);
+                }
                 let status = response.status();
                 if status.is_redirection() {
                     let location = response
@@ -313,7 +304,12 @@ fn login(
                     );
                 }
                 match response.text() {
-                    Ok(text) => return (parse_response(&text), last_route),
+                    Ok(text) => {
+                        if !still_connected() {
+                            return (Outcome::NetworkChanged, last_route);
+                        }
+                        return (parse_response(&text), last_route);
+                    }
                     Err(_) => errors.push(format!("{}：响应读取失败", route_label(route))),
                 }
             }
@@ -535,9 +531,15 @@ fn run_cycle(
         attempt += 1;
         state.attempt = attempt;
         let ip = if config.auto_detect_ip {
-            network.ip.map(|ip| ip.to_string())
+            network
+                .ip
+                .filter(|ip| campus_ip(&config, *ip))
+                .map(|ip| ip.to_string())
         } else {
-            Some(config.wlan_user_ip.clone())
+            network
+                .ip
+                .filter(|ip| campus_ip(&config, *ip))
+                .map(|_| config.wlan_user_ip.clone())
         };
         if let Some(ip) = ip {
             // 检查时间用于 status；不把每轮 checking 写入事件日志，以免重复认证刷屏。
@@ -600,7 +602,7 @@ fn status(paths: &Paths) {
     println!(
         "后台服务：{}",
         if service.is_some() {
-            "已启用，每 15 秒检查"
+            "已启用，网络事件触发、每 60 秒兜底检查"
         } else {
             "未启用，请运行 bash install.sh"
         }
@@ -626,7 +628,7 @@ fn status(paths: &Paths) {
             },
             display_time(state.checked_at)
         );
-        if Local::now().timestamp().saturating_sub(state.checked_at) > 45 {
+        if Local::now().timestamp().saturating_sub(state.checked_at) > 120 {
             println!("检查记录已过期；可运行 login 或 doctor 检查后台和网络。");
         }
         if !state.network.is_empty() {

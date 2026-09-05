@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 LABEL="com.nowaywastaken.csustautologin"
 DOMAIN="gui/$(id -u)"
 BINARY_DEST="$HOME/.local/bin/csust-auto-login"
+MONITOR_DEST="$HOME/.local/bin/csust-auto-login-monitor"
 DATA_DIR="$HOME/Library/Application Support/csust-auto-login"
 LOG_DIR="$HOME/Library/Logs/csust-auto-login"
 PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -18,7 +19,7 @@ case "$ACTION" in
     if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
       launchctl bootout "$DOMAIN/$LABEL"
     fi
-    rm -f "$PLIST_DEST" "$BINARY_DEST"
+    rm -f "$PLIST_DEST" "$BINARY_DEST" "$MONITOR_DEST"
     echo "已卸载后台任务和安装的程序；账号配置与日志已保留，可重新安装恢复。"
     exit 0
     ;;
@@ -28,6 +29,12 @@ esac
 
 echo "正在编译校园网自动登录..."
 cargo build --release --locked
+if ! command -v swiftc >/dev/null 2>&1; then
+  echo "安装需要 macOS 的 swiftc（通常随 Xcode Command Line Tools 提供）。" >&2
+  exit 1
+fi
+swiftc -swift-version 5 -O -framework Network \
+  -o target/release/csust-auto-login-monitor network_monitor.swift
 install -d -m 700 "$DATA_DIR" "$LOG_DIR"
 mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents"
 if [[ ! -f "$DATA_DIR/config.json" ]]; then
@@ -49,6 +56,11 @@ cleanup() {
     else
       rm -f "$BINARY_DEST"
     fi
+    if [[ -f "$STAGING_DIR/previous-monitor" ]]; then
+      cp -p "$STAGING_DIR/previous-monitor" "$MONITOR_DEST"
+    else
+      rm -f "$MONITOR_DEST"
+    fi
     if [[ -f "$STAGING_DIR/previous.plist" ]]; then
       cp -p "$STAGING_DIR/previous.plist" "$PLIST_DEST"
       if [[ "$PREVIOUS_LOADED" == true ]]; then
@@ -58,31 +70,38 @@ cleanup() {
       rm -f "$PLIST_DEST"
     fi
   fi
-  rm -f "$STAGING_DIR/binary" "$STAGING_DIR/service.plist" "$STAGING_DIR/previous-binary" "$STAGING_DIR/previous.plist"
+  rm -f "$STAGING_DIR/binary" "$STAGING_DIR/monitor" "$STAGING_DIR/service.plist" \
+    "$STAGING_DIR/previous-binary" "$STAGING_DIR/previous-monitor" "$STAGING_DIR/previous.plist"
   rmdir "$STAGING_DIR"
   return "$result"
 }
 trap cleanup EXIT
 
 if [[ -e "$BINARY_DEST" ]]; then cp -p "$BINARY_DEST" "$STAGING_DIR/previous-binary"; fi
+if [[ -e "$MONITOR_DEST" ]]; then cp -p "$MONITOR_DEST" "$STAGING_DIR/previous-monitor"; fi
 if [[ -e "$PLIST_DEST" ]]; then cp -p "$PLIST_DEST" "$STAGING_DIR/previous.plist"; fi
 install -m 755 ./target/release/csust-auto-login "$STAGING_DIR/binary"
+install -m 755 ./target/release/csust-auto-login-monitor "$STAGING_DIR/monitor"
 cp "./$LABEL.plist" "$STAGING_DIR/service.plist"
-plutil -replace Program -string "$BINARY_DEST" "$STAGING_DIR/service.plist"
+plutil -replace Program -string "$MONITOR_DEST" "$STAGING_DIR/service.plist"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $MONITOR_DEST" "$STAGING_DIR/service.plist"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:1 $BINARY_DEST" "$STAGING_DIR/service.plist"
 plutil -insert WorkingDirectory -string "$DATA_DIR" "$STAGING_DIR/service.plist"
 plutil -insert StandardErrorPath -string "$LOG_DIR/launchd.stderr.log" "$STAGING_DIR/service.plist"
 plutil -lint "$STAGING_DIR/service.plist"
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$STAGING_DIR/service.plist")" == "$BINARY_DEST" ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$STAGING_DIR/service.plist")" == run ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$STAGING_DIR/service.plist")" == "$MONITOR_DEST" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$STAGING_DIR/service.plist")" == "$MONITOR_DEST" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$STAGING_DIR/service.plist")" == "$BINARY_DEST" ]]
 
 if [[ "$PREVIOUS_LOADED" == true ]]; then launchctl bootout "$DOMAIN/$LABEL"; fi
 CHANGED=true
 mv -f "$STAGING_DIR/binary" "$BINARY_DEST"
+mv -f "$STAGING_DIR/monitor" "$MONITOR_DEST"
 mv -f "$STAGING_DIR/service.plist" "$PLIST_DEST"
 launchctl enable "$DOMAIN/$LABEL"
 launchctl bootstrap "$DOMAIN" "$PLIST_DEST"
 CHANGED=false
-echo "安装完成。每次登录 macOS 后自动运行，每 15 秒检查一次校园网。"
+echo "安装完成。网络变化时自动检查，每 60 秒兜底检查一次校园网。"
 echo "配置向导：csust-auto-login configure"
 echo "立即登录：csust-auto-login login"
 echo "查看状态：csust-auto-login status"
