@@ -1,414 +1,719 @@
-//! CSUST eportal 校园网自动登录工具（Rust 实现）
-//!
-//! 纯 Rust 重写，零 Python 依赖，编译为原生 macOS 二进制。
-//! 功能与原 Python 脚本完全一致：
-//! - 自动检测 SSID 是否为目标校园网
-//! - 自动检测本机 IP
-//! - 通过 GET 请求完成 eportal 认证
-//! - 日志记录与自动清理
-//! - macOS 原生通知
-
 mod config;
+#[cfg(test)]
+mod tests;
 
 use chrono::Local;
-use config::*;
+use config::{private_dir, save_json, Config, Paths, ProxyMode};
 use reqwest::blocking::Client;
-use std::fs;
-use std::io::{self, Write};
-use std::net::UdpSocket;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-// --------------- 工具函数 ---------------
+const LABEL: &str = "com.nowaywastaken.csustautologin";
 
-/// 获取当前日期时间字符串，用于日志文件名
-fn timestamp_str() -> String {
-    Local::now().format("%Y%m%d%H%M%S%f").to_string()[..16].to_string()
+fn command(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// macOS 原生通知（通过 osascript）
-fn show_alert(message: &str, title: &str) {
-    let safe_msg = message.replace('"', "\\\"");
-    let script = format!(
-        r#"display notification "{}" with title "{}""#,
-        safe_msg, title
-    );
-    if let Err(e) = Command::new("osascript").arg("-e").arg(&script).output() {
-        eprintln!("[{title}] {message} (通知发送失败: {e})");
+fn parse_ssid_line(line: &str) -> Option<String> {
+    let (label, value) = line.trim().split_once(':')?;
+    let value = value.trim();
+    (matches!(label.trim(), "SSID" | "Current Wi-Fi Network")
+        && !value.is_empty()
+        && !matches!(value, "<redacted>" | "<unknown>" | "(null)"))
+    .then(|| value.to_owned())
+}
+
+fn usable_ip(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_link_local()
+        || octets[0] >= 224
+        || octets[0] == 0
+        || octets[0] == 198 && matches!(octets[1], 18 | 19))
+}
+
+#[derive(Clone)]
+struct Network {
+    interface: String,
+    ssid: Option<String>,
+    ip: Option<Ipv4Addr>,
+}
+
+impl Network {
+    fn key(&self) -> String {
+        format!(
+            "{} / {}",
+            self.interface,
+            self.ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "等待 IPv4".into())
+        )
     }
 }
 
-/// 清理过期日志文件
-fn cleanup_old_logs(logs_dir: &PathBuf, max_age_hours: f64) {
-    if !logs_dir.exists() {
-        return;
+fn scan_networks() -> Vec<Network> {
+    let hardware =
+        command("/usr/sbin/networksetup", &["-listallhardwareports"]).unwrap_or_default();
+    let mut interfaces: Vec<String> = hardware
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Device: ").map(str::to_owned))
+        .collect();
+    if interfaces.is_empty() {
+        interfaces = command("/sbin/ifconfig", &["-l"])
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
     }
-    let cutoff = Local::now().timestamp() as f64 - (max_age_hours * 3600.0);
-    if let Ok(entries) = fs::read_dir(logs_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("log") {
-                if let Ok(meta) = path.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                            if (duration.as_secs_f64()) < cutoff {
-                                let _ = fs::remove_file(&path);
-                            }
-                        }
-                    }
-                }
+    interfaces
+        .into_iter()
+        .filter(|name| {
+            name.strip_prefix("en")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|interface| {
+            let summary =
+                command("/usr/sbin/ipconfig", &["getsummary", &interface]).unwrap_or_default();
+            let ssid = summary.lines().find_map(parse_ssid_line).or_else(|| {
+                command(
+                    "/usr/sbin/networksetup",
+                    &["-getairportnetwork", &interface],
+                )
+                .and_then(|text| text.lines().find_map(parse_ssid_line))
+            });
+            let ip = command("/usr/sbin/ipconfig", &["getifaddr", &interface])
+                .and_then(|text| text.parse().ok())
+                .filter(|ip| usable_ip(*ip));
+            Network {
+                interface,
+                ssid,
+                ip,
             }
-        }
-    }
+        })
+        .collect()
 }
 
-/// 将内容写入日志文件
-fn log_to_file(content: &str, filename_prefix: &str) {
-    let logs_dir = project_dir().join("logs");
-    if fs::create_dir_all(&logs_dir).is_err() {
-        return;
-    }
-    let prefix = if filename_prefix.is_empty() {
-        String::new()
-    } else {
-        format!("{}_", filename_prefix)
+fn select_network(config: &Config, networks: &[Network]) -> Option<Network> {
+    let campus_ip = |network: &&Network| {
+        network.ip.is_some_and(|ip| {
+            usable_ip(ip)
+                && config
+                    .ip_prefixes
+                    .iter()
+                    .any(|prefix| ip.to_string().starts_with(prefix))
+        })
     };
-    let log_path = logs_dir.join(format!("{}{}.log", prefix, timestamp_str()));
-    let _ = fs::write(&log_path, content);
-
-    // 清理旧日志
-    cleanup_old_logs(&logs_dir, LOG_MAX_AGE_HOURS);
+    let target_ssid = |network: &&Network| {
+        network
+            .ssid
+            .as_deref()
+            .is_some_and(|ssid| ssid.eq_ignore_ascii_case(&config.ssid))
+    };
+    networks
+        .iter()
+        .filter(|n| n.interface.starts_with("en"))
+        .find(campus_ip)
+        .or_else(|| {
+            networks
+                .iter()
+                .filter(|n| n.interface.starts_with("en"))
+                .filter(target_ssid)
+                .find(|n| n.ip.is_some_and(usable_ip))
+        })
+        .or_else(|| {
+            networks
+                .iter()
+                .filter(|n| n.interface.starts_with("en"))
+                .find(target_ssid)
+        })
+        .cloned()
 }
 
-/// 获取当前 SSID（macOS）
-fn get_current_ssid() -> Option<String> {
-    for interface in &["en0", "en1", "en2"] {
-        // 方案1：ipconfig getsummary (更快)
-        if let Ok(output) = Command::new("ipconfig")
-            .arg("getsummary")
-            .arg(interface)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let trimmed = line.trim();
-                    if let Some(val) = trimmed.strip_prefix("SSID : ") {
-                        let ssid = val.trim().to_string();
-                        if !ssid.is_empty() {
-                            return Some(ssid);
-                        }
-                    }
-                }
-            }
-        }
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Online,
+    Credentials,
+    Retry(String),
+    NetworkChanged,
+}
 
-        // 方案2：networksetup 备选
-        if let Ok(output) = Command::new("networksetup")
-            .arg("-getairportnetwork")
-            .arg(interface)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(val) = stdout.trim().strip_prefix("Current Wi-Fi Network: ") {
-                    let ssid = val.trim().to_string();
-                    if !ssid.is_empty() {
-                        return Some(ssid);
-                    }
-                }
-            }
-        }
+fn parse_response(text: &str) -> Outcome {
+    let text = text.trim();
+    let json = text
+        .split_once('(')
+        .filter(|(callback, _)| callback.trim() == "dr1003")
+        .and_then(|(_, body)| body.trim_end_matches(';').trim().strip_suffix(')'))
+        .unwrap_or(text);
+    let value = serde_json::from_str::<serde_json::Value>(json).ok();
+    let message = value
+        .as_ref()
+        .and_then(|v| v.get("msg"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(text);
+    let message = message.trim();
+    if [
+        "密码错误",
+        "账号错误",
+        "帐号错误",
+        "账号不存在",
+        "用户不存在",
+        "用户名或密码错误",
+        "账号已欠费",
+    ]
+    .iter()
+    .any(|word| message.contains(word))
+        || matches!(
+            message.to_ascii_lowercase().as_str(),
+            "invalid password" | "invalid credentials"
+        )
+    {
+        return Outcome::Credentials;
     }
-    None
-}
-
-/// 通过 UDP Socket 推断本机局域网出口 IP
-fn detect_local_ip() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let ip = socket.local_addr().ok()?;
-    Some(ip.ip().to_string())
-}
-
-/// 项目根目录
-fn project_dir() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let dir = exe
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    if dir.ends_with("target/debug") || dir.ends_with("target/release") {
-        // target/{debug,release} -> 向上两级到项目根目录
-        dir.parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    let already_online = message.contains("已经在线")
+        || message.contains("已在线")
+        || matches!(
+            message
+                .trim_end_matches(['!', '.', '！'])
+                .to_ascii_lowercase()
+                .as_str(),
+            "already online" | "user already online" | "user is already online"
+        );
+    let success = value
+        .as_ref()
+        .is_some_and(|v| v.get("result").is_some_and(|r| r == 1 || r == "1"));
+    if success || already_online || text.contains("Dr.COMWebLoginID_3.htm") {
+        Outcome::Online
+    } else if text.contains("认证超时") {
+        Outcome::Retry("认证超时，将自动重试。".into())
+    } else if text.contains("Dr.COMWebLoginID_2.htm") {
+        Outcome::Retry("认证被拒绝，请检查认证参数。".into())
     } else {
-        dir
+        // 不输出原始响应：门户可能在 HTML/JSON 中回显账号、密码或请求 URL。
+        Outcome::Retry("未收到可确认的认证结果，可运行 csust-auto-login doctor 检查连接。".into())
     }
 }
 
-/// 写入权限检测
-fn check_writable() -> Result<(), String> {
-    let test_path = project_dir().join(".write_test");
-    fs::write(&test_path, "test")
-        .map_err(|e| format!("当前目录缺少写入权限：{:?}\n{}", project_dir(), e))?;
-    let _ = fs::remove_file(&test_path);
+fn routes(config: &Config) -> &[&str] {
+    match config.proxy_mode {
+        ProxyMode::Auto => &["direct", "proxy"],
+        ProxyMode::Direct => &["direct"],
+        ProxyMode::Proxy => &["proxy"],
+    }
+}
+
+fn client(config: &Config, route: &str) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(!config.verify_ssl)
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(config.timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .http1_only()
+        .referer(false)
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36");
+    if route == "proxy" {
+        builder =
+            builder.proxy(reqwest::Proxy::all(&config.proxy_url).map_err(|_| "代理地址无效。")?);
+    }
+    builder.build().map_err(|_| "无法创建 HTTP 客户端。".into())
+}
+
+fn connection_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "连接超时"
+    } else if error.is_connect() {
+        "无法建立连接（请检查网络或代理是否启动）"
+    } else {
+        "连接中断"
+    }
+}
+
+fn route_label(route: &str) -> &str {
+    match route {
+        "direct" => "直连",
+        "proxy" => "本地代理",
+        _ => "尚未选择",
+    }
+}
+
+fn login(
+    config: &Config,
+    ip: &str,
+    mut still_connected: impl FnMut() -> bool,
+) -> (Outcome, String) {
+    let account = format!(",0,{}", config.username);
+    let params = [
+        ("callback", "dr1003"),
+        ("login_method", "1"),
+        ("user_account", &account),
+        ("user_password", &config.password),
+        ("wlan_user_ip", ip),
+        ("wlan_user_ipv6", ""),
+        ("wlan_user_mac", "000000000000"),
+        ("wlan_ac_ip", ""),
+        ("wlan_ac_name", ""),
+        ("jsVersion", "4.2.1"),
+        ("terminal_type", "1"),
+        ("lang", "zh-cn"),
+        ("v", "8207"),
+    ];
+    let referer = reqwest::Url::parse(&config.server_url)
+        .ok()
+        .map(|url| format!("{}/", url.origin().ascii_serialization()))
+        .unwrap_or_default();
+    let mut errors = Vec::new();
+    let mut last_route = String::new();
+    for &route in routes(config) {
+        if !still_connected() {
+            return (Outcome::NetworkChanged, last_route);
+        }
+        last_route = route.to_owned();
+        let client = match client(config, route) {
+            Ok(client) => client,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        let response = client
+            .get(&config.server_url)
+            .header("Referer", &referer)
+            .query(&params)
+            .send();
+        match response {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_redirection() {
+                    let location = response
+                        .headers()
+                        .get("location")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("");
+                    return (parse_response(location), last_route);
+                }
+                if !status.is_success() {
+                    return (
+                        Outcome::Retry(format!(
+                            "认证服务器返回 HTTP {}，将自动重试。",
+                            status.as_u16()
+                        )),
+                        last_route,
+                    );
+                }
+                match response.text() {
+                    Ok(text) => return (parse_response(&text), last_route),
+                    Err(_) => errors.push(format!("{}：响应读取失败", route_label(route))),
+                }
+            }
+            Err(error) => errors.push(format!(
+                "{}：{}",
+                route_label(route),
+                connection_error(&error)
+            )),
+        }
+    }
+    (Outcome::Retry(errors.join("；")), last_route)
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+struct State {
+    phase: String,
+    detail: String,
+    network: String,
+    route: String,
+    checked_at: i64,
+    checking: bool,
+    last_success: Option<i64>,
+    failure_since: Option<i64>,
+    notified: bool,
+    credentials_blocked: bool,
+    config_key: u64,
+    attempt: u32,
+}
+
+impl State {
+    fn read(paths: &Paths) -> Self {
+        fs::read(&paths.state)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn transition(&mut self, phase: &str, detail: &str, now: i64) -> (bool, bool) {
+        let changed = self.phase != phase || self.detail != detail;
+        let needs_action = matches!(phase, "credentials" | "config_error");
+        if needs_action && self.phase != phase {
+            self.notified = false;
+        }
+        self.phase = phase.into();
+        self.detail = detail.into();
+        self.checked_at = now;
+        self.checking = false;
+        if matches!(phase, "online" | "outside") {
+            self.failure_since = None;
+            self.notified = false;
+        }
+        if phase == "online" {
+            self.last_success = Some(now);
+        }
+        let mut notify = false;
+        if matches!(
+            phase,
+            "credentials" | "config_error" | "retry" | "waiting_ip"
+        ) {
+            let since = *self.failure_since.get_or_insert(now);
+            notify = !self.notified && (needs_action || now.saturating_sub(since) >= 120);
+            self.notified |= notify;
+        }
+        (changed, notify)
+    }
+}
+
+#[cfg(not(test))]
+fn show_alert(message: &str) {
+    // argv 避免把通知内容拼接为 AppleScript 源码。
+    let script = "on run argv\n display notification (item 1 of argv) with title \"校园网自动登录\"\nend run";
+    if !Command::new("/usr/bin/osascript")
+        .args(["-e", script, message])
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("系统通知未送达，请运行 csust-auto-login status 查看详情。");
+    }
+}
+
+#[cfg(test)]
+fn show_alert(_: &str) {}
+
+fn cleanup_logs(paths: &Paths) {
+    let Ok(entries) = fs::read_dir(&paths.logs) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if chrono::NaiveDate::parse_from_str(&name, "%Y-%m-%d.log").is_ok()
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|time| SystemTime::now().duration_since(time).ok())
+                .is_some_and(|age| age > Duration::from_secs(7 * 86400))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn log_event(paths: &Paths, state: &State) -> std::io::Result<()> {
+    private_dir(&paths.logs)?;
+    let path = paths
+        .logs
+        .join(format!("{}.log", Local::now().format("%Y-%m-%d")));
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    writeln!(
+        log,
+        "{} [{}] {} / {}",
+        Local::now().format("%F %T"),
+        state.phase,
+        route_label(&state.route),
+        state.detail
+    )
+}
+
+fn record(paths: &Paths, state: &mut State, phase: &str, message: &str) {
+    let (changed, notify) = state.transition(phase, message, Local::now().timestamp());
+    if changed || phase == "retry" {
+        if let Err(error) = log_event(paths, state) {
+            eprintln!("日志写入失败：{error}");
+        }
+    }
+    // 先持久化通知去重；状态无法保存时不反复弹窗，认证仍继续。
+    match save_json(&paths.state, state) {
+        Ok(()) if notify => show_alert(&format!("{message}\n详情：csust-auto-login status")),
+        Err(error) => eprintln!("状态保存失败：{error}"),
+        _ => {}
+    }
+}
+
+fn run_cycle(
+    paths: &Paths,
+    manual: bool,
+    mut scan: impl FnMut() -> Vec<Network>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), String> {
+    private_dir(&paths.data).map_err(|e| format!("无法打开运行目录：{e}"))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(paths.data.join("run.lock"))
+        .map_err(|e| e.to_string())?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            if manual {
+                println!("后台正在检查网络，请运行 csust-auto-login status 查看进度。");
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(format!("无法取得运行锁：{error}")),
+    }
+    cleanup_logs(paths);
+    let mut state = State::read(paths);
+    if manual {
+        state.credentials_blocked = false;
+        state.failure_since = None;
+        state.notified = false;
+    }
+    let mut attempt = 0;
+    loop {
+        let config = match Config::effective(&paths.config) {
+            Ok(config) => config,
+            Err(error) => {
+                record(paths, &mut state, "config_error", &error);
+                return if manual { Err(error) } else { Ok(()) };
+            }
+        };
+        let mut hash = DefaultHasher::new();
+        // 仅作本地配置变更检测；状态文件与含密码的配置文件均限当前用户读取。
+        serde_json::to_vec(&config)
+            .map_err(|e| e.to_string())?
+            .hash(&mut hash);
+        let config_key = hash.finish();
+        if config_key != state.config_key {
+            state.config_key = config_key;
+            state.credentials_blocked = false;
+            state.failure_since = None;
+            state.notified = false;
+        }
+        let Some(network) = select_network(&config, &scan()) else {
+            state.network.clear();
+            state.route.clear();
+            state.attempt = 0;
+            record(paths, &mut state, "outside", "未连接校园网，等待网络变化。");
+            if manual {
+                println!("{}", state.detail);
+            }
+            return Ok(());
+        };
+        let key = network.key();
+        if state.network != key {
+            state.network = key.clone();
+            state.failure_since = None;
+            state.notified = false;
+        }
+        if state.credentials_blocked {
+            record(
+                paths,
+                &mut state,
+                "credentials",
+                "认证信息被拒绝，请运行 configure 修改配置，或运行 login 手动重试。",
+            );
+            return Ok(());
+        }
+        if attempt >= config.retry_attempts {
+            return if manual { Err(state.detail) } else { Ok(()) };
+        }
+        attempt += 1;
+        state.attempt = attempt;
+        let ip = if config.auto_detect_ip {
+            network.ip.map(|ip| ip.to_string())
+        } else {
+            Some(config.wlan_user_ip.clone())
+        };
+        if let Some(ip) = ip {
+            // 检查时间用于 status；不把每轮 checking 写入事件日志，以免重复认证刷屏。
+            state.checked_at = Local::now().timestamp();
+            state.checking = true;
+            let _ = save_json(&paths.state, &state);
+            let (outcome, route) = login(&config, &ip, || {
+                select_network(&config, &scan()).is_some_and(|current| current.key() == key)
+            });
+            state.route = route;
+            match outcome {
+                Outcome::Online => {
+                    record(paths, &mut state, "online", "登录成功或已经在线。");
+                    if manual {
+                        println!("{}（{}）", state.detail, route_label(&state.route));
+                    }
+                    return Ok(());
+                }
+                Outcome::Credentials => {
+                    state.credentials_blocked = true;
+                    record(
+                        paths,
+                        &mut state,
+                        "credentials",
+                        "认证信息被拒绝，请运行 configure 修改配置，或运行 login 手动重试。",
+                    );
+                    return if manual { Err(state.detail) } else { Ok(()) };
+                }
+                Outcome::Retry(error) => record(paths, &mut state, "retry", &error),
+                Outcome::NetworkChanged => {
+                    record(paths, &mut state, "retry", "网络已变化，重新检查。");
+                    continue;
+                }
+            }
+        } else {
+            state.route.clear();
+            record(
+                paths,
+                &mut state,
+                "waiting_ip",
+                "已连接校园 Wi-Fi，等待系统分配 IPv4 地址。",
+            );
+        }
+        if attempt >= config.retry_attempts {
+            return if manual { Err(state.detail) } else { Ok(()) };
+        }
+        sleep(Duration::from_secs(config.retry_interval_secs));
+    }
+}
+
+fn display_time(timestamp: i64) -> String {
+    chrono::DateTime::from_timestamp(timestamp, 0)
+        .map(|time| time.with_timezone(&Local).format("%F %T").to_string())
+        .unwrap_or_else(|| "未知".into())
+}
+
+fn status(paths: &Paths) {
+    let uid = command("/usr/bin/id", &["-u"]).unwrap_or_default();
+    let service = command("/bin/launchctl", &["print", &format!("gui/{uid}/{LABEL}")]);
+    println!(
+        "后台服务：{}",
+        if service.is_some() {
+            "已启用，每 15 秒检查"
+        } else {
+            "未启用，请运行 bash install.sh"
+        }
+    );
+    if let Some(service) = service {
+        for line in service
+            .lines()
+            .filter(|line| line.trim().starts_with("last exit code ="))
+        {
+            println!("launchd：{}", line.trim());
+        }
+    }
+    let state = State::read(paths);
+    if state.checked_at == 0 {
+        println!("尚无检查记录。");
+    } else {
+        println!(
+            "当前状态：{}\n最近检查：{}",
+            if state.checking {
+                "正在检查认证状态…"
+            } else {
+                &state.detail
+            },
+            display_time(state.checked_at)
+        );
+        if Local::now().timestamp().saturating_sub(state.checked_at) > 45 {
+            println!("检查记录已过期；可运行 login 或 doctor 检查后台和网络。");
+        }
+        if !state.network.is_empty() {
+            println!("网络：{}", state.network);
+        }
+        println!(
+            "连接方式：{}；本轮尝试：{}",
+            route_label(&state.route),
+            state.attempt
+        );
+    }
+    if let Some(time) = state.last_success {
+        println!("最近在线：{}", display_time(time));
+    }
+    match Config::effective(&paths.config) {
+        Ok(_) => println!("配置：有效"),
+        Err(error) => println!("配置：{error}"),
+    }
+    println!(
+        "配置文件：{}\n日志目录：{}",
+        paths.config.display(),
+        paths.logs.display()
+    );
+}
+
+fn doctor(paths: &Paths) -> Result<(), String> {
+    status(paths);
+    let config = Config::effective(&paths.config)?;
+    let networks = scan_networks();
+    for network in &networks {
+        println!(
+            "网卡 {}：IPv4={}，SSID={}",
+            network.interface,
+            network
+                .ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "未分配".into()),
+            network.ssid.as_deref().unwrap_or("不可读取")
+        );
+    }
+    if select_network(&config, &networks).is_none() {
+        println!("当前不在配置的校园网络，跳过校园服务器探测；未发送认证请求。");
+        return Ok(());
+    }
+    let server = reqwest::Url::parse(&config.server_url).map_err(|_| "认证地址无效。")?;
+    let root = format!("{}/", server.origin().ascii_serialization());
+    for &route in routes(&config) {
+        match client(&config, route)?.get(&root).send() {
+            Ok(response) => println!(
+                "{}：服务器可达，HTTP {}",
+                route_label(route),
+                response.status().as_u16()
+            ),
+            Err(error) => println!("{}：{}", route_label(route), connection_error(&error)),
+        }
+    }
+    println!("诊断结束，仅探测服务器根路径，未发送账号密码或认证请求。");
     Ok(())
 }
 
-// --------------- 登录逻辑 ---------------
-
-/// 构建登录参数
-fn build_params<'a>(
-    username: &'a str,
-    password: &'a str,
-    wlan_ip: &'a str,
-) -> Vec<(&'a str, String)> {
-    let user_account = format!(",0,{}", username);
-    vec![
-        ("callback", "dr1003".to_string()),
-        ("login_method", "1".to_string()),
-        ("user_account", user_account),
-        ("user_password", password.to_string()),
-        ("wlan_user_ip", wlan_ip.to_string()),
-        ("wlan_user_ipv6", String::new()),
-        ("wlan_user_mac", "000000000000".to_string()),
-        ("wlan_ac_ip", String::new()),
-        ("wlan_ac_name", String::new()),
-        ("jsVersion", "4.2.1".to_string()),
-        ("terminal_type", "1".to_string()),
-        ("lang", "zh-cn".to_string()),
-        ("v", "8207".to_string()),
-    ]
-}
-
-/// 检查登录响应是否表示成功
-fn is_login_successful(text: &str) -> bool {
-    text.contains("Dr.COMWebLoginID_3.htm")
-        || text.contains("成功")
-        || text.to_lowercase().contains("online")
-        || text.contains("已经在线")
-        || text.contains("认证成功")
-}
-
-/// 检查登录响应是否表示密码错误
-fn is_login_failed(text: &str) -> bool {
-    text.contains("Dr.COMWebLoginID_2.htm")
-        || text.contains("密码错误")
-        || text.contains("认证超时")
-}
-
-// --------------- 登录执行（单次尝试） ---------------
-
-/// 执行单次登录尝试，返回 true 表示已连上网（成功/已在线），false 表示需要重试
-fn try_login(on_target_ssid: bool) -> bool {
-    // 检测本机 IP
-    let detected_ip = detect_local_ip();
-
-    // IP 段匹配 (10.161.*) —— 非目标 SSID 时用于判断是否在校园网环境
-    let ip_match = detected_ip
-        .as_ref()
-        .map(|ip| ip.starts_with("10.161."))
-        .unwrap_or(false);
-
-    // 既不是目标 SSID 也不是校园网 IP 段 → 环境不匹配，无需重试
-    if !on_target_ssid && !ip_match {
-        return true;
+fn entry() -> Result<(), String> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let action = args.first().map(String::as_str).unwrap_or("run");
+    if args.len() > 1 {
+        return Err("仅接受一个命令；运行 csust-auto-login --help 查看用法。".into());
     }
-
-    // 连通性检测：如果能上网就不再执行登录
-    if can_reach_internet() {
-        return true;
+    if matches!(action, "--help" | "-h" | "help") {
+        println!("校园网自动登录\n  configure  配置账号、密码与连接方式\n  login      立即尝试登录\n  status     查看后台和最近登录状态\n  doctor     检查网络连接，不提交认证\n  run        后台检查一轮（默认）\n安装/更新：bash install.sh\n卸载：bash install.sh uninstall（保留配置和日志）");
+        return Ok(());
     }
-
-    // 获取密码
-    let password = match PASSWORD {
-        Some(pw) => pw.to_string(),
-        None => match std::env::var("CSUST_PASSWORD") {
-            Ok(pw) => pw,
-            Err(_) => {
-                print!("Password: ");
-                let _ = io::stdout().flush();
-                let mut pw = String::new();
-                if io::stdin().read_line(&mut pw).is_ok() {
-                    pw.trim().to_string()
-                } else {
-                    show_alert("无法读取密码输入。", "配置错误");
-                    std::process::exit(2);
-                }
-            }
-        },
-    };
-
-    // 自动检测 IP（每次重试重新检测，因为 IP 可能变化）
-    let wlan_ip = if AUTO_DETECT_IP {
-        match detect_local_ip() {
-            Some(ip) => ip,
-            None => {
-                // IP 尚未就绪，重试
-                return false;
-            }
+    let home = std::env::var_os("HOME").ok_or("无法确定用户目录。")?;
+    let paths = Paths::for_home(Path::new(&home));
+    match action {
+        "configure" => config::configure(&paths),
+        "login" | "run" => run_cycle(&paths, action == "login", scan_networks, std::thread::sleep),
+        "status" => {
+            status(&paths);
+            Ok(())
         }
-    } else {
-        WLAN_USER_IP.to_string()
-    };
-
-    // 构造 HTTP 客户端
-    let client: Client = Client::builder()
-        .danger_accept_invalid_certs(!VERIFY_SSL)
-        .timeout(Duration::from_secs(TIMEOUT_SECS))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36")
-        .no_proxy()
-        .referer(false)
-        .build()
-        .unwrap_or_else(|e| {
-            show_alert(&format!("无法创建 HTTP 客户端: {e}"), "初始化失败");
-            std::process::exit(3);
-        });
-
-    // 构造请求 URL
-    let params = build_params(USERNAME, &password, &wlan_ip);
-    let url = format!("{}://{}:{}{}", SCHEME, HOST, PORT, LOGIN_PATH);
-
-    // 发送请求
-    let referer = format!("{}://{}:{}/", SCHEME, HOST, PORT);
-    match client
-        .get(&url)
-        .header("Referer", &referer)
-        .query(&params)
-        .send()
-    {
-        Ok(resp) => {
-            let text = resp.text().unwrap_or_default();
-
-            // 保存日志
-            let log_content = format!(
-                "Request URL: {}\nParams: {:?}\n{}\n{}",
-                url,
-                params,
-                "-".repeat(40),
-                text
-            );
-            log_to_file(&log_content, "RUN");
-
-            // 判断登录结果
-            if is_login_successful(&text) {
-                println!("登录成功或已在线。");
-                return true;
-            }
-            if is_login_failed(&text) {
-                show_alert("登录失败: 账号密码有误或登录参数失效。", "登录失败");
-            } else {
-                let preview = if text.len() > 200 {
-                    format!("{}...", &text[..200])
-                } else {
-                    text.to_string()
-                };
-                show_alert(
-                    &format!("无法确定登录结果。服务器返回：\n{}", preview),
-                    "状态未知",
-                );
-            }
-
-            // 登录失败，需要重试
-            false
-        }
-        Err(e) => {
-            let err_msg = format!(
-                "网络连接失败: {e:?}\nURL: {}\nDetected IP: {}",
-                url, wlan_ip
-            );
-            log_to_file(&err_msg, "ERR");
-            show_alert(
-                &format!("{}\n\n(提示: 请检查是否连上了校园网 WiFi)", err_msg),
-                "网络异常",
-            );
-            // 网络异常，重试
-            false
-        }
+        "doctor" => doctor(&paths),
+        _ => Err("未知命令；运行 csust-auto-login --help 查看用法。".into()),
     }
 }
-
-// --------------- 主流程 ---------------
 
 fn main() {
-    // 启动延时，等待网络栈稳定
-    std::thread::sleep(Duration::from_secs(STARTUP_DELAY_SECS));
-
-    // 写入权限检测
-    if let Err(msg) = check_writable() {
-        show_alert(&msg, "权限错误");
+    if let Err(error) = entry() {
+        eprintln!("{error}");
         std::process::exit(1);
     }
-
-    // 启动时立即清理旧日志
-    cleanup_old_logs(&project_dir().join("logs"), LOG_MAX_AGE_HOURS);
-
-    // 检测 SSID，判断是否在目标校园网下
-    let current_ssid = get_current_ssid();
-    let on_target_ssid = current_ssid
-        .as_ref()
-        .map(|s| s.to_lowercase() == TARGET_SSID.to_lowercase())
-        .unwrap_or(false);
-
-    // 如果不是目标 SSID，尝试有限次数后退出
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-
-        if !on_target_ssid && attempt > RETRY_ATTEMPTS {
-            // 非目标 SSID 有限重试耗尽，静默退出
-            return;
-        }
-
-        if attempt > 1 {
-            std::thread::sleep(Duration::from_secs(RETRY_INTERVAL_SECS));
-        }
-
-        if try_login(on_target_ssid) {
-            return;
-        }
-    }
-}
-
-// --------------- 连通性检测 ---------------
-
-/// 检查能否连通外网（204 探针方式）
-fn can_reach_internet() -> bool {
-    let probes = [
-        "http://connect.rom.miui.com/generate_204",
-        "http://www.gstatic.com/generate_204",
-        "http://captive.apple.com/hotspot-detect.html",
-    ];
-    for url in &probes {
-        match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .no_proxy()
-            .danger_accept_invalid_certs(true)
-            .build()
-        {
-            Ok(client) => match client.get(*url).send() {
-                Ok(resp) => {
-                    // 204 No Content = 确认在线
-                    if resp.status() == reqwest::StatusCode::NO_CONTENT {
-                        return true;
-                    }
-                    // Apple captive 探针，在线时返回 200 + "Success"
-                    if resp.status().is_success() {
-                        if let Ok(body) = resp.text() {
-                            if body.contains("Success") {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        }
-    }
-    false
 }

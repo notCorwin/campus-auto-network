@@ -4,13 +4,20 @@
 <dict>
     <key>Label</key>
     <string>com.nowaywastaken.csustautologin</string>
+    <key>Program</key>
+    <string>INSTALLER_SETS_BINARY_PATH</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/nowaywastaken/CsustNetAutoLogin/target/release/csust-auto-login</string>
+        <string>csust-auto-login</string>
+        <string>run</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>StartInterval</key>
     <integer>15</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Umask</key>
+    <integer>63</integer>
 </dict>
 </plist>
