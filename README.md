@@ -1,66 +1,49 @@
 # 校园网自动登录
 
-macOS 上的 CSUST 校园网后台认证工具。登录 macOS 后监听 Wi-Fi 网络变化，连接目标 SSID 且取得校园 IPv4 后自动认证；每 60 秒额外检查一次。只使用真实 Wi-Fi 网卡，不使用 TUN 虚拟地址作为认证 IP。
+macOS 15+ 原生 Swift 菜单栏 App。首次启动申请定位权限，之后通过 CoreWLAN Wi‑Fi 事件、NWPathMonitor 和 60 秒兜底检查监测网络；只有精确匹配目标 SSID 且取得校园 IPv4 后才自动认证。
 
 ## 安装与使用
 
-需要 macOS、Rust 1.89 或更新版本，以及 `swiftc`（通常随 Xcode Command Line Tools 提供）。首次安装没有配置时会进入终端向导；更新安装保留已有配置。
-
 ```sh
 bash install.sh
-
-csust-auto-login configure  # 修改账号、密码和连接方式，无需重新编译
-csust-auto-login login      # 立即尝试，也可手动重试被拒绝的凭据
-csust-auto-login status     # 后台服务、最近检查、最近在线、日志位置
-csust-auto-login doctor     # 查看网卡并探测服务器，不提交认证
-
-bash install.sh uninstall   # 移除安装的程序和后台任务，保留配置与日志
 ```
 
-程序安装到 `~/.local/bin/csust-auto-login` 和 `~/.local/bin/csust-auto-login-monitor`，移动或删除源码目录不影响后台运行。若 `~/.local/bin` 不在 PATH 中，使用该完整路径运行命令。重新执行安装脚本即可更新；安装失败会尝试恢复此前的程序和后台配置。
+App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注册登录时启动。首次运行会打开设置页；填写账号、密码、SSID、认证地址和连接方式后保存。
 
-## 配置
+若系统没有弹出定位权限提示，在菜单栏 App 中点击“申请定位权限”，或打开：
 
-配置文件：`~/Library/Application Support/csust-auto-login/config.json`。向导留空保留现值，密码输入隐藏；配置以 `600` 权限原子保存。后台只读取配置，不会等待键盘输入。
+`系统设置 → 隐私与安全性 → 定位服务 → 系统服务 → 网络与无线`
 
-除向导中的账号、密码、SSID、认证地址和代理设置外，还可直接编辑以下字段：
+菜单栏提供立即检查、诊断、设置、登录时自动启动和退出。卸载：
 
-| 字段 | 默认值与用途 |
-| --- | --- |
-| `proxy_mode` | `auto`：先直连，仅连接失败时尝试代理；`direct`：只直连；`proxy`：只用代理 |
-| `proxy_url` | `http://127.0.0.1:7890` |
-| `ip_prefixes` | `["10.161.", "10.183."]`，精确 SSID 匹配后的校园 IPv4 校验 |
-| `auto_detect_ip` | `true`，使用选中物理网卡的 IPv4 |
-| `wlan_user_ip` | 手动 IPv4；仅在 `auto_detect_ip` 为 `false` 时使用，仍须检测到校园网络 |
-| `verify_ssl` | `false`，保留校园认证服务器的证书兼容设置 |
-| `timeout_secs` | `15`，单次请求总超时；建立连接最多等待 3 秒 |
-| `retry_attempts` | `3`，一轮最多尝试次数 |
-| `retry_interval_secs` | `5`，两次尝试之间的等待时间 |
+```sh
+bash install.sh uninstall
+```
 
-非空账号、密码、SSID 和合法 HTTP/HTTPS 认证地址是必填项；时间配置范围为 1–3600 秒，重试次数须大于 0。省略其他字段会使用默认值，未知字段会报配置错误。
+卸载只移除 App、旧 LaunchAgent 和旧 CLI，保留配置与日志。
 
-`CSUST_PASSWORD` 环境变量优先于保存的密码。终端的临时环境变量只影响从该终端启动的命令，不会自动传给 launchd；日常后台使用向导保存的配置即可。
+## 运行规则
 
-## 自动恢复与通知
+- CoreWLAN 读取 SSID/BSSID；定位权限不可用或系统返回 `<redacted>` 时拒绝自动认证，不用 IP 前缀猜测 SSID。
+- 只接受目标 SSID 的真实 Wi‑Fi 接口和配置中的校园 IPv4 前缀（默认 `10.161.`、`10.183.`）。
+- 自动模式先直连，连接失败后尝试 HTTP/HTTPS 代理；也支持仅直连或仅代理。
+- 每次请求前后重新确认网络；切换 SSID、接口或 IPv4 会停止当前认证轮次。
+- 连接失败有限重试；连续失败满 2 分钟通知一次，账号密码错误立即暂停自动尝试，修改配置或点击立即检查后恢复。
+- 日志写入 `~/Library/Logs/csust-auto-login`，保留 7 天；不保存原始响应、密码或认证查询串。
 
-- 正常认证和“已经在线”保持静默；在线状态表示认证服务器确认，不额外使用外网探针推断校园认证状态。
-- 暂时断网按配置有限重试，网络事件或下个兜底周期继续；持续失败满 2 分钟提醒一次，恢复后结束该失败事件。
-- 明确的账号、密码错误或欠费提示只提醒一次，暂停使用相同配置自动认证；修改有效配置或运行 `login` 后恢复尝试。认证超时属于可重试故障。
-- 只有真实 Wi-Fi 网卡、精确 SSID 和校园 IPv4 同时满足才自动认证；每次请求前后重新判断网络，离开校园网立即停止该轮认证。手动运行与后台任务通过同一个文件锁互斥。
-- 睡眠时不唤醒电脑；恢复后由网络事件或 60 秒兜底检查发现网络。
+## 配置迁移
 
-日志目录：`~/Library/Logs/csust-auto-login`。每日事件日志记录状态变化与错误，保留 7 天，不保存原始响应、密码或认证查询串。`launchd.stderr.log` 用于程序启动及本地文件写入问题诊断。日志写入失败不会阻止认证。
+首次启动时，App 会将旧版 `~/Library/Application Support/csust-auto-login/config.json` 导入 UserDefaults，字段和默认值保持兼容；旧 JSON 不删除，便于回滚。`CSUST_PASSWORD` 环境变量仍优先于保存的密码。
 
 ## 开发与验证
 
+需要 Xcode 26 或包含 macOS 15 SDK 的 Command Line Tools。项目不引入第三方 Swift 依赖：
+
 ```sh
-cargo test --locked
-cargo build --release --locked
-swiftc -swift-version 5 -typecheck network_monitor.swift
+bash build.sh
 bash -n install.sh build.sh
-plutil -lint com.nowaywastaken.csustautologin.plist
+plutil -lint Info.plist
+codesign --verify --deep --strict target/CampusAutoLogin.app
 ```
 
-测试使用本地 HTTP 服务与临时用户数据目录，覆盖代理回退、请求编码、错误分类、重试上限、严格 SSID/IP 判定、网络变化、通知去重和并发互斥，不发送真实校园认证请求。真实校园网下还需检查首次连接、DHCP 延迟、唤醒、掉线恢复及代理开关。
-
-仓库中的 plist 是安装模板，请通过安装脚本加载，不要直接复制到 LaunchAgents。
+`build.sh` 会编译 App、进行本机 ad-hoc 签名，并运行内置 self-test。`src/` 中的 Rust 实现保留作协议和迁移参考，不再参与 App 构建或后台运行。

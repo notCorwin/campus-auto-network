@@ -5,108 +5,118 @@ cd "$(dirname "$0")"
 
 LABEL="com.nowaywastaken.csustautologin"
 DOMAIN="gui/$(id -u)"
-BINARY_DEST="$HOME/.local/bin/csust-auto-login"
-MONITOR_DEST="$HOME/.local/bin/csust-auto-login-monitor"
+APP_NAME="CampusAutoLogin"
+APP_SOURCE="$(pwd)/target/CampusAutoLogin.app"
+APP_DEST="$HOME/Applications/$APP_NAME.app"
 DATA_DIR="$HOME/Library/Application Support/csust-auto-login"
-LOG_DIR="$HOME/Library/Logs/csust-auto-login"
-PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
+OLD_BINARY="$HOME/.local/bin/csust-auto-login"
+OLD_MONITOR="$HOME/.local/bin/csust-auto-login-monitor"
+OLD_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 ACTION="install"
-if [[ $# -gt 1 ]]; then echo "用法：bash install.sh [install|uninstall]" >&2; exit 2; fi
+if [[ $# -gt 1 ]]; then
+  echo "用法：bash install.sh [install|uninstall]" >&2
+  exit 2
+fi
 if [[ $# -eq 1 ]]; then ACTION="$1"; fi
+
+old_loaded() {
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+stop_old_service() {
+  if old_loaded; then launchctl bootout "$DOMAIN/$LABEL"; fi
+}
+
+quit_app() {
+  if [[ -x "$APP_DEST/Contents/MacOS/CampusAutoLogin" ]]; then
+    "$APP_DEST/Contents/MacOS/CampusAutoLogin" --unregister >/dev/null 2>&1 || true
+  fi
+  osascript -e "tell application id \"$LABEL\" to quit" >/dev/null 2>&1 || true
+}
+
 case "$ACTION" in
   uninstall)
-    if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-      launchctl bootout "$DOMAIN/$LABEL"
-    fi
-    rm -f "$PLIST_DEST" "$BINARY_DEST" "$MONITOR_DEST"
-    echo "已卸载后台任务和安装的程序；账号配置与日志已保留，可重新安装恢复。"
+    stop_old_service
+    quit_app
+    rm -rf "$APP_DEST"
+    rm -f "$OLD_PLIST" "$OLD_BINARY" "$OLD_MONITOR"
+    echo "已卸载 App 和旧后台任务；配置与日志已保留。"
     exit 0
     ;;
   install) ;;
-  *) echo "用法：bash install.sh [install|uninstall]" >&2; exit 2 ;;
+  *)
+    echo "用法：bash install.sh [install|uninstall]" >&2
+    exit 2
+    ;;
 esac
 
-echo "正在编译校园网自动登录..."
-cargo build --release --locked
-if ! command -v swiftc >/dev/null 2>&1; then
-  echo "安装需要 macOS 的 swiftc（通常随 Xcode Command Line Tools 提供）。" >&2
-  exit 1
-fi
-swiftc -swift-version 5 -O -framework Network \
-  -o target/release/csust-auto-login-monitor network_monitor.swift
-install -d -m 700 "$DATA_DIR" "$LOG_DIR"
-mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents"
-if [[ ! -f "$DATA_DIR/config.json" ]]; then
-  ./target/release/csust-auto-login configure
-fi
+echo "正在构建校园网自动登录 App..."
+bash build.sh
+[[ -x "$APP_SOURCE/Contents/MacOS/CampusAutoLogin" ]]
 
+install -d -m 700 "$DATA_DIR" "$HOME/Applications"
 STAGING_DIR="$(mktemp -d "$DATA_DIR/install.XXXXXX")"
 PREVIOUS_LOADED=false
 CHANGED=false
-if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then PREVIOUS_LOADED=true; fi
+
+if old_loaded; then PREVIOUS_LOADED=true; fi
 
 cleanup() {
   local result=$?
   if [[ $result -ne 0 && "$CHANGED" == true ]]; then
-    echo "安装失败，恢复此前的程序与后台配置..." >&2
-    launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+    echo "安装失败，恢复此前的后台配置..." >&2
+    quit_app
+    rm -rf "$APP_DEST"
+    if [[ -d "$STAGING_DIR/previous-app" ]]; then
+      ditto "$STAGING_DIR/previous-app" "$APP_DEST"
+    fi
     if [[ -f "$STAGING_DIR/previous-binary" ]]; then
-      cp -p "$STAGING_DIR/previous-binary" "$BINARY_DEST"
-    else
-      rm -f "$BINARY_DEST"
+      install -m 755 "$STAGING_DIR/previous-binary" "$OLD_BINARY"
     fi
     if [[ -f "$STAGING_DIR/previous-monitor" ]]; then
-      cp -p "$STAGING_DIR/previous-monitor" "$MONITOR_DEST"
-    else
-      rm -f "$MONITOR_DEST"
+      install -m 755 "$STAGING_DIR/previous-monitor" "$OLD_MONITOR"
     fi
     if [[ -f "$STAGING_DIR/previous.plist" ]]; then
-      cp -p "$STAGING_DIR/previous.plist" "$PLIST_DEST"
+      install -m 600 "$STAGING_DIR/previous.plist" "$OLD_PLIST"
       if [[ "$PREVIOUS_LOADED" == true ]]; then
-        launchctl bootstrap "$DOMAIN" "$PLIST_DEST" || true
+        launchctl bootstrap "$DOMAIN" "$OLD_PLIST" || true
       fi
-    else
-      rm -f "$PLIST_DEST"
     fi
   fi
-  rm -f "$STAGING_DIR/binary" "$STAGING_DIR/monitor" "$STAGING_DIR/service.plist" \
-    "$STAGING_DIR/previous-binary" "$STAGING_DIR/previous-monitor" "$STAGING_DIR/previous.plist"
-  rmdir "$STAGING_DIR"
+  rm -rf "$STAGING_DIR"
   return "$result"
 }
 trap cleanup EXIT
 
-if [[ -e "$BINARY_DEST" ]]; then cp -p "$BINARY_DEST" "$STAGING_DIR/previous-binary"; fi
-if [[ -e "$MONITOR_DEST" ]]; then cp -p "$MONITOR_DEST" "$STAGING_DIR/previous-monitor"; fi
-if [[ -e "$PLIST_DEST" ]]; then cp -p "$PLIST_DEST" "$STAGING_DIR/previous.plist"; fi
-install -m 755 ./target/release/csust-auto-login "$STAGING_DIR/binary"
-install -m 755 ./target/release/csust-auto-login-monitor "$STAGING_DIR/monitor"
-cp "./$LABEL.plist" "$STAGING_DIR/service.plist"
-plutil -replace Program -string "$MONITOR_DEST" "$STAGING_DIR/service.plist"
-/usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $MONITOR_DEST" "$STAGING_DIR/service.plist"
-/usr/libexec/PlistBuddy -c "Set :ProgramArguments:1 $BINARY_DEST" "$STAGING_DIR/service.plist"
-plutil -insert WorkingDirectory -string "$DATA_DIR" "$STAGING_DIR/service.plist"
-plutil -insert StandardErrorPath -string "$LOG_DIR/launchd.stderr.log" "$STAGING_DIR/service.plist"
-plutil -lint "$STAGING_DIR/service.plist"
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :Program' "$STAGING_DIR/service.plist")" == "$MONITOR_DEST" ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$STAGING_DIR/service.plist")" == "$MONITOR_DEST" ]]
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$STAGING_DIR/service.plist")" == "$BINARY_DEST" ]]
+if [[ -d "$APP_DEST" ]]; then ditto "$APP_DEST" "$STAGING_DIR/previous-app"; fi
+if [[ -f "$OLD_BINARY" ]]; then cp -p "$OLD_BINARY" "$STAGING_DIR/previous-binary"; fi
+if [[ -f "$OLD_MONITOR" ]]; then cp -p "$OLD_MONITOR" "$STAGING_DIR/previous-monitor"; fi
+if [[ -f "$OLD_PLIST" ]]; then cp -p "$OLD_PLIST" "$STAGING_DIR/previous.plist"; fi
 
-if [[ "$PREVIOUS_LOADED" == true ]]; then launchctl bootout "$DOMAIN/$LABEL"; fi
+quit_app
+sleep 0.5
+stop_old_service
+rm -rf "$APP_DEST"
+ditto "$APP_SOURCE" "$APP_DEST"
 CHANGED=true
-mv -f "$STAGING_DIR/binary" "$BINARY_DEST"
-mv -f "$STAGING_DIR/monitor" "$MONITOR_DEST"
-mv -f "$STAGING_DIR/service.plist" "$PLIST_DEST"
-launchctl enable "$DOMAIN/$LABEL"
-launchctl bootstrap "$DOMAIN" "$PLIST_DEST"
+
+open "$APP_DEST"
+started=false
+for _ in {1..10}; do
+  if pgrep -f "$APP_DEST/Contents/MacOS/CampusAutoLogin" >/dev/null 2>&1; then
+    started=true
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$started" != true ]]; then
+  echo "App 未能启动，请检查系统日志。" >&2
+  exit 1
+fi
+
+rm -f "$OLD_PLIST" "$OLD_BINARY" "$OLD_MONITOR"
 CHANGED=false
-echo "安装完成。网络变化时自动检查，每 60 秒兜底检查一次校园网。"
-echo "配置向导：csust-auto-login configure"
-echo "立即登录：csust-auto-login login"
-echo "查看状态：csust-auto-login status"
-echo "连接诊断：csust-auto-login doctor"
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) echo "当前 PATH 不含 ~/.local/bin，请使用完整路径：$BINARY_DEST" ;;
-esac
+echo "安装完成。App 已启动，网络事件触发、每 60 秒兜底检查一次。"
+echo "配置：打开菜单栏的“校园网自动登录” → 设置…"
+echo "卸载：bash install.sh uninstall（配置与日志保留）"

@@ -3,17 +3,33 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "🔨 正在编译 csust-auto-login (release mode)..."
-cargo build --release --locked
-swiftc -swift-version 5 -O -framework Network \
-  -o target/release/csust-auto-login-monitor network_monitor.swift
+APP_PATH="$(pwd)/target/CampusAutoLogin.app"
+EXECUTABLE="$APP_PATH/Contents/MacOS/CampusAutoLogin"
+
+echo "🔨 正在编译校园网自动登录 App..."
+rm -rf "$APP_PATH"
+mkdir -p "$APP_PATH/Contents/MacOS"
+swiftc -swift-version 5 -O -parse-as-library \
+  -framework AppKit \
+  -framework SwiftUI \
+  -framework CoreLocation \
+  -framework CoreWLAN \
+  -framework CryptoKit \
+  -framework Network \
+  -framework ServiceManagement \
+  -framework UserNotifications \
+  -o "$EXECUTABLE" CampusAutoLoginApp.swift
+cp Info.plist "$APP_PATH/Contents/Info.plist"
+codesign --force --deep --sign - "$APP_PATH" >/dev/null
+codesign --verify --deep --strict "$APP_PATH"
+
+"$EXECUTABLE" --self-test
 
 echo ""
-echo "✅ 编译完成！二进制文件位置："
-echo "   $(pwd)/target/release/csust-auto-login"
-echo "   $(pwd)/target/release/csust-auto-login-monitor"
+echo "✅ 编译完成！App 位置："
+echo "   $APP_PATH"
 echo ""
-echo "💡 配置账号密码：./target/release/csust-auto-login configure"
+echo "💡 运行 App 后，在菜单栏打开设置配置账号密码"
 echo ""
 echo "🚀 如需开机自启，请执行："
 echo "   bash install.sh"
