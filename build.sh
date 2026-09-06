@@ -11,7 +11,8 @@ echo "🔨 正在编译校园网自动登录 App..."
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS"
 swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typecheck \
-  -framework AppKit \
+	-target arm64-apple-macosx13.0 \
+	-framework AppKit \
   -framework SwiftUI \
   -framework CoreLocation \
   -framework CoreWLAN \
@@ -21,7 +22,8 @@ swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typechec
   -framework UserNotifications \
   CampusAutoLoginApp.swift AppUpdater.swift
 swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
-  -framework AppKit \
+	-target arm64-apple-macosx13.0 \
+	-framework AppKit \
   -framework SwiftUI \
   -framework CoreLocation \
   -framework CoreWLAN \
