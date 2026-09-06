@@ -16,6 +16,7 @@ private let campusLoginURL = URL(string: "https://login.csust.edu.cn:802/eportal
 private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
 private let autoStartDefaultsKey = "autoStartEnabled"
+private let settingsWindowIdentifier = "com.nowaywastaken.csustautologin.settings"
 
 struct AppError: Error, LocalizedError, Sendable, Equatable {
     let message: String
@@ -1475,16 +1476,27 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         permissionStatus = locationManager.authorizationStatus
         refreshNetworks()
         if permissionStatus == .authorized {
-            NSApp.setActivationPolicy(.accessory)
+            restoreBackgroundActivationIfNeeded()
             requestCheck()
         } else {
             requestCheck()
         }
     }
 
+    func restoreBackgroundActivationIfNeeded() {
+        guard permissionStatus == .authorized else { return }
+        let settingsWindowIsVisible = NSApp.windows.contains {
+            $0.isVisible && $0.identifier?.rawValue == settingsWindowIdentifier
+        }
+        guard !settingsWindowIsVisible else { return }
+        NSApp.setActivationPolicy(.accessory)
+    }
+
     func openSettingsWindow() {
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            restoreBackgroundActivationIfNeeded()
             diagnosticText = "无法打开设置窗口，请从菜单栏重新打开“设置…”。"
         }
     }
@@ -1520,13 +1532,7 @@ struct MenuContent: View {
         Divider()
         Button("立即检查") { model.checkNow() }
         Button("诊断") { model.runDoctor() }
-        if #available(macOS 14.0, *) {
-            SettingsLink {
-                Text("设置…")
-            }
-        } else {
-            Button("设置…") { model.openSettingsWindow() }
-        }
+        Button("设置…") { model.openSettingsWindow() }
         if model.permissionStatus != .authorized {
             Button("申请定位权限") { model.requestLocationPermissionIfNeeded() }
             Button("打开定位设置") { model.openLocationSettings() }
@@ -1601,6 +1607,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 620)
         .padding()
+        .background(SettingsWindowConfiguration())
         .onAppear { reload() }
     }
 
@@ -1624,6 +1631,24 @@ struct SettingsView: View {
     }
 }
 
+private struct SettingsWindowConfiguration: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        SettingsWindowProbe()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class SettingsWindowProbe: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard let window else { return }
+        window.identifier = NSUserInterfaceItemIdentifier(settingsWindowIdentifier)
+        window.collectionBehavior = [.managed, .primary]
+        NSApp.setActivationPolicy(.regular)
+    }
+}
+
 struct MenuBarLabel: View {
     @ObservedObject var model: AppModel
 
@@ -1638,6 +1663,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var instanceLock: AppInstanceLock?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(settingsWindowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: nil
+        )
         if CommandLine.arguments.contains("--self-test") {
             SelfTest.run()
             NSApp.terminate(nil)
@@ -1668,7 +1699,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: nil)
         AppModel.shared.stop()
+    }
+
+    @objc private func settingsWindowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window.identifier?.rawValue == settingsWindowIdentifier else {
+            return
+        }
+        DispatchQueue.main.async {
+            AppModel.shared.restoreBackgroundActivationIfNeeded()
+        }
     }
 
     private func signalReadinessIfRequested() {
