@@ -1532,7 +1532,13 @@ struct MenuContent: View {
         Divider()
         Button("立即检查") { model.checkNow() }
         Button("诊断") { model.runDoctor() }
-        Button("设置…") { model.openSettingsWindow() }
+        if #available(macOS 14.0, *) {
+            SettingsLink {
+                Text("设置…")
+            }
+        } else {
+            Button("设置…") { model.openSettingsWindow() }
+        }
         if model.permissionStatus != .authorized {
             Button("申请定位权限") { model.requestLocationPermissionIfNeeded() }
             Button("打开定位设置") { model.openLocationSettings() }
