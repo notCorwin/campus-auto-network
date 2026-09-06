@@ -25,6 +25,7 @@ pub struct Config {
     pub auto_detect_ip: bool,
     pub wlan_user_ip: String,
     pub verify_ssl: bool,
+    pub allow_insecure_transport: bool,
     pub proxy_mode: ProxyMode,
     pub proxy_url: String,
     pub timeout_secs: u64,
@@ -42,7 +43,8 @@ impl Default for Config {
             ip_prefixes: vec!["10.161.".into(), "10.183.".into()],
             auto_detect_ip: true,
             wlan_user_ip: String::new(),
-            verify_ssl: false,
+            verify_ssl: true,
+            allow_insecure_transport: false,
             proxy_mode: ProxyMode::Auto,
             proxy_url: "http://127.0.0.1:7890".into(),
             timeout_secs: 15,
@@ -88,6 +90,12 @@ impl Config {
             || server.fragment().is_some()
         {
             return Err("server_url 只允许 HTTP/HTTPS 地址，不含凭据、查询串或片段。".into());
+        }
+        if (server.scheme() != "https" || !self.verify_ssl) && !self.allow_insecure_transport {
+            return Err(
+                "认证地址必须使用 HTTPS 并验证服务器证书；如确有兼容需求，请明确允许不安全传输。"
+                    .into(),
+            );
         }
         if self.ssid.trim().is_empty() {
             return Err("ssid 不能为空。".into());

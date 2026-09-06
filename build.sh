@@ -9,7 +9,17 @@ EXECUTABLE="$APP_PATH/Contents/MacOS/CampusAutoLogin"
 echo "🔨 正在编译校园网自动登录 App..."
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS"
-swiftc -swift-version 5 -O -parse-as-library \
+swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typecheck \
+  -framework AppKit \
+  -framework SwiftUI \
+  -framework CoreLocation \
+  -framework CoreWLAN \
+  -framework CryptoKit \
+  -framework Network \
+  -framework ServiceManagement \
+  -framework UserNotifications \
+  CampusAutoLoginApp.swift
+swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
   -framework AppKit \
   -framework SwiftUI \
   -framework CoreLocation \
@@ -24,6 +34,7 @@ codesign --force --deep --sign - "$APP_PATH" >/dev/null
 codesign --verify --deep --strict "$APP_PATH"
 
 "$EXECUTABLE" --self-test
+bash install.sh self-test
 
 echo ""
 echo "✅ 编译完成！App 位置："

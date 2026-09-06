@@ -15,13 +15,13 @@ private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
 private let autoStartDefaultsKey = "autoStartEnabled"
 
-struct AppError: Error, LocalizedError {
+struct AppError: Error, LocalizedError, Sendable, Equatable {
     let message: String
 
     var errorDescription: String? { message }
 }
 
-enum ProxyMode: String, Codable, CaseIterable, Identifiable {
+enum ProxyMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case auto
     case direct
     case proxy
@@ -37,7 +37,7 @@ enum ProxyMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-struct AppConfig: Codable, Equatable {
+struct AppConfig: Codable, Equatable, Sendable {
     var username: String
     var password: String
     var ssid: String
@@ -46,6 +46,7 @@ struct AppConfig: Codable, Equatable {
     var autoDetectIP: Bool
     var wlanUserIP: String
     var verifySSL: Bool
+    var allowInsecureTransport: Bool
     var proxyMode: ProxyMode
     var proxyURL: String
     var timeoutSecs: UInt64
@@ -60,7 +61,8 @@ struct AppConfig: Codable, Equatable {
         ipPrefixes: ["10.161.", "10.183."],
         autoDetectIP: true,
         wlanUserIP: "",
-        verifySSL: false,
+        verifySSL: true,
+        allowInsecureTransport: false,
         proxyMode: .auto,
         proxyURL: "http://127.0.0.1:7890",
         timeoutSecs: 15,
@@ -75,6 +77,7 @@ struct AppConfig: Codable, Equatable {
         case autoDetectIP = "auto_detect_ip"
         case wlanUserIP = "wlan_user_ip"
         case verifySSL = "verify_ssl"
+        case allowInsecureTransport = "allow_insecure_transport"
         case proxyMode = "proxy_mode"
         case proxyURL = "proxy_url"
         case timeoutSecs = "timeout_secs"
@@ -91,6 +94,7 @@ struct AppConfig: Codable, Equatable {
         autoDetectIP: Bool,
         wlanUserIP: String,
         verifySSL: Bool,
+        allowInsecureTransport: Bool,
         proxyMode: ProxyMode,
         proxyURL: String,
         timeoutSecs: UInt64,
@@ -105,6 +109,7 @@ struct AppConfig: Codable, Equatable {
         self.autoDetectIP = autoDetectIP
         self.wlanUserIP = wlanUserIP
         self.verifySSL = verifySSL
+        self.allowInsecureTransport = allowInsecureTransport
         self.proxyMode = proxyMode
         self.proxyURL = proxyURL
         self.timeoutSecs = timeoutSecs
@@ -122,6 +127,7 @@ struct AppConfig: Codable, Equatable {
         autoDetectIP = try container.decodeIfPresent(Bool.self, forKey: .autoDetectIP) ?? Self.default.autoDetectIP
         wlanUserIP = try container.decodeIfPresent(String.self, forKey: .wlanUserIP) ?? ""
         verifySSL = try container.decodeIfPresent(Bool.self, forKey: .verifySSL) ?? Self.default.verifySSL
+        allowInsecureTransport = try container.decodeIfPresent(Bool.self, forKey: .allowInsecureTransport) ?? Self.default.allowInsecureTransport
         proxyMode = try container.decodeIfPresent(ProxyMode.self, forKey: .proxyMode) ?? Self.default.proxyMode
         proxyURL = try container.decodeIfPresent(String.self, forKey: .proxyURL) ?? Self.default.proxyURL
         timeoutSecs = try container.decodeIfPresent(UInt64.self, forKey: .timeoutSecs) ?? Self.default.timeoutSecs
@@ -143,6 +149,10 @@ struct AppConfig: Codable, Equatable {
               server.query == nil,
               server.fragment == nil else {
             return "认证地址必须是完整的 HTTP/HTTPS 地址，且不含凭据、查询串或片段。"
+        }
+
+        if let error = transportValidationError() {
+            return error
         }
 
         if ssid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -168,6 +178,33 @@ struct AppConfig: Codable, Equatable {
         return nil
     }
 
+    func transportValidationError() -> String? {
+        guard let scheme = URLComponents(string: serverURL)?.scheme?.lowercased() else {
+            return "认证地址必须使用 HTTPS；如确有兼容需求，请在设置中明确允许不安全传输。"
+        }
+        guard scheme == "http" || scheme == "https" else {
+            return "认证地址必须使用 HTTP/HTTPS；如确有兼容需求，请在设置中明确允许不安全传输。"
+        }
+        if (scheme != "https" || !verifySSL) && !allowInsecureTransport {
+            return scheme == "https"
+                ? "必须验证认证服务器证书；如确有兼容需求，请在设置中明确允许不安全传输。"
+                : "认证地址必须使用 HTTPS；如确有兼容需求，请在设置中明确允许不安全传输。"
+        }
+        return nil
+    }
+
+    var transportWarning: String? {
+        guard allowInsecureTransport else { return nil }
+        guard let scheme = URLComponents(string: serverURL)?.scheme?.lowercased() else { return nil }
+        if scheme != "https" {
+            return "警告：认证账号和密码将通过 HTTP 发送，可能被窃听。"
+        }
+        if !verifySSL {
+            return "警告：认证服务器证书不会被验证，可能遭受中间人攻击。"
+        }
+        return nil
+    }
+
     private static func validPrefix(_ prefix: String) -> Bool {
         guard prefix.hasSuffix(".") else { return false }
         let body = prefix.dropLast()
@@ -176,7 +213,7 @@ struct AppConfig: Codable, Equatable {
     }
 }
 
-struct AppPaths {
+struct AppPaths: Sendable {
     let data: URL
     let legacyConfig: URL
     let legacyState: URL
@@ -189,6 +226,13 @@ struct AppPaths {
         legacyState = data.appendingPathComponent("state.json")
         logs = home.appendingPathComponent("Library/Logs/csust-auto-login", isDirectory: true)
     }
+
+    init(data: URL, legacyConfig: URL, legacyState: URL, logs: URL) {
+        self.data = data
+        self.legacyConfig = legacyConfig
+        self.legacyState = legacyState
+        self.logs = logs
+    }
 }
 
 private func ensurePrivateDirectory(_ url: URL) throws {
@@ -197,7 +241,89 @@ private func ensurePrivateDirectory(_ url: URL) throws {
     try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
 }
 
-final class AppStore {
+enum AppInstanceLockError: Error, LocalizedError {
+    case alreadyRunning
+    case openFailed(String)
+    case lockFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .alreadyRunning: return "校园网自动登录已经在运行。"
+        case .openFailed(let message): return "无法打开运行锁：\(message)"
+        case .lockFailed(let message): return "无法取得运行锁：\(message)"
+        }
+    }
+}
+
+final class AppInstanceLock: @unchecked Sendable {
+    private let descriptor: Int32
+
+    init(path: URL) throws {
+        let descriptor = Darwin.open(path.path, O_CREAT | O_RDWR, mode_t(0o600))
+        guard descriptor >= 0 else {
+            throw AppInstanceLockError.openFailed(String(cString: strerror(errno)))
+        }
+        if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            let error = errno
+            close(descriptor)
+            if error == EWOULDBLOCK || error == EAGAIN {
+                throw AppInstanceLockError.alreadyRunning
+            }
+            throw AppInstanceLockError.lockFailed(String(cString: strerror(error)))
+        }
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        _ = flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+}
+
+final class CancellationSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private let wake = DispatchSemaphore(value: 0)
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        let shouldWake = !cancelled
+        cancelled = true
+        lock.unlock()
+        if shouldWake { wake.signal() }
+    }
+
+    func isCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func wait(for interval: TimeInterval) -> Bool {
+        wake.wait(timeout: .now() + interval) == .success
+    }
+}
+
+final class EngineSnapshot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var networks: [WiFiNetwork] = []
+    private var permissionAuthorized = false
+
+    func update(networks: [WiFiNetwork], permissionAuthorized: Bool) {
+        lock.lock()
+        self.networks = networks
+        self.permissionAuthorized = permissionAuthorized
+        lock.unlock()
+    }
+
+    func read() -> (networks: [WiFiNetwork], permissionAuthorized: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (networks, permissionAuthorized)
+    }
+}
+
+final class AppStore: @unchecked Sendable {
     private let defaults: UserDefaults
     let paths: AppPaths
     private let lock = NSLock()
@@ -235,9 +361,9 @@ final class AppStore {
 
     func config() -> Result<AppConfig, AppError> {
         lock.lock()
+        defer { lock.unlock() }
         let result: Result<AppConfig, AppError> = configError
             .map { .failure(AppError(message: $0)) } ?? .success(storedConfig)
-        lock.unlock()
         return result
     }
 
@@ -261,32 +387,40 @@ final class AppStore {
         }
         let encoded = try JSONEncoder().encode(config)
         lock.lock()
+        defer { lock.unlock() }
         storedConfig = config
         configError = nil
-        lock.unlock()
         defaults.set(encoded, forKey: configDefaultsKey)
     }
 
     func loadState() -> AppState {
+        lock.lock()
+        defer { lock.unlock() }
         if let data = defaults.data(forKey: stateDefaultsKey),
            let state = try? JSONDecoder().decode(AppState.self, from: data) {
             return state
         }
         if let data = try? Data(contentsOf: paths.legacyState),
            let state = try? JSONDecoder().decode(AppState.self, from: data) {
-            saveState(state)
+            if let encoded = try? JSONEncoder().encode(state) {
+                defaults.set(encoded, forKey: stateDefaultsKey)
+            }
             return state
         }
         return AppState()
     }
 
     func saveState(_ state: AppState) {
+        lock.lock()
+        defer { lock.unlock() }
         if let encoded = try? JSONEncoder().encode(state) {
             defaults.set(encoded, forKey: stateDefaultsKey)
         }
     }
 
     func autoStartEnabled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
         if defaults.object(forKey: autoStartDefaultsKey) == nil {
             defaults.set(true, forKey: autoStartDefaultsKey)
             return true
@@ -295,6 +429,8 @@ final class AppStore {
     }
 
     func setAutoStartEnabled(_ enabled: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
         defaults.set(enabled, forKey: autoStartDefaultsKey)
     }
 
@@ -305,7 +441,7 @@ final class AppStore {
     }
 }
 
-struct AppState: Codable, Equatable {
+struct AppState: Codable, Equatable, Sendable {
     var phase = ""
     var detail = ""
     var network = ""
@@ -382,7 +518,7 @@ struct AppState: Codable, Equatable {
     }
 }
 
-struct WiFiNetwork: Equatable {
+struct WiFiNetwork: Equatable, Sendable {
     let interfaceName: String
     let ssid: String?
     let bssid: String?
@@ -486,9 +622,10 @@ enum AuthOutcome: Equatable {
     case networkChanged
 }
 
-private final class LoginSessionDelegate: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+private final class LoginSessionDelegate: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate, @unchecked Sendable {
     let verifySSL: Bool
-    var redirectLocation: String?
+    private let lock = NSLock()
+    private var storedRedirectLocation: String?
 
     init(verifySSL: Bool) {
         self.verifySSL = verifySSL
@@ -501,7 +638,9 @@ private final class LoginSessionDelegate: NSObject, URLSessionDataDelegate, URLS
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        redirectLocation = response.value(forHTTPHeaderField: "Location")
+        lock.lock()
+        storedRedirectLocation = response.value(forHTTPHeaderField: "Location")
+        lock.unlock()
         completionHandler(nil)
     }
 
@@ -534,6 +673,12 @@ private final class LoginSessionDelegate: NSObject, URLSessionDataDelegate, URLS
             completionHandler(.performDefaultHandling, nil)
         }
     }
+
+    func redirectLocation() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedRedirectLocation
+    }
 }
 
 private struct HTTPResult {
@@ -542,12 +687,36 @@ private struct HTTPResult {
     let redirectLocation: String?
 }
 
+private final class HTTPResponseBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var body = Data()
+    private var statusCode = 0
+    private var requestError: Error?
+
+    func set(data: Data, statusCode: Int, error: Error?) {
+        lock.lock()
+        self.body = data
+        self.statusCode = statusCode
+        self.requestError = error
+        lock.unlock()
+    }
+
+    func value() -> (body: Data, statusCode: Int, error: Error?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (body, statusCode, requestError)
+    }
+}
+
 enum LoginService {
     static func login(
         config: AppConfig,
         ip: String,
-        stillConnected: () -> Bool
+        stillConnected: @escaping @Sendable () -> Bool
     ) -> (AuthOutcome, String) {
+        if let error = config.validationError() {
+            return (.retry(error), "")
+        }
         let account = ",0,\(config.username)"
         let parameters = [
             ("callback", "dr1003"),
@@ -580,7 +749,7 @@ enum LoginService {
                 errors.append("认证地址无效")
                 continue
             }
-            switch perform(request: request, config: config, route: route) {
+            switch perform(request: request, config: config, route: route, shouldContinue: stillConnected) {
             case .failure(let error):
                 errors.append("\(routeLabel(route))：\(error)")
             case .success(let response):
@@ -602,6 +771,9 @@ enum LoginService {
     }
 
     static func probe(config: AppConfig, route: String) -> Result<Int, AppError> {
+        if let error = config.validationError() {
+            return .failure(AppError(message: error))
+        }
         guard let server = URLComponents(string: config.serverURL),
               let scheme = server.scheme,
               let host = server.host else {
@@ -614,17 +786,9 @@ enum LoginService {
         root.path = "/"
         guard let rootURL = root.url else { return .failure(AppError(message: "认证地址无效")) }
         let request = URLRequest(url: rootURL)
-        switch perform(request: request, config: config, route: route) {
+        switch perform(request: request, config: config, route: route, shouldContinue: { true }) {
         case .success(let result): return .success(result.statusCode)
         case .failure(let error): return .failure(error)
-        }
-    }
-
-    private static func routeNames(for mode: ProxyMode) -> [String] {
-        switch mode {
-        case .auto: return ["direct", "proxy"]
-        case .direct: return ["direct"]
-        case .proxy: return ["proxy"]
         }
     }
 
@@ -647,7 +811,8 @@ enum LoginService {
     private static func perform(
         request: URLRequest,
         config: AppConfig,
-        route: String
+        route: String,
+        shouldContinue: @escaping @Sendable () -> Bool
     ) -> Result<HTTPResult, AppError> {
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.waitsForConnectivity = false
@@ -685,37 +850,45 @@ enum LoginService {
         let delegate = LoginSessionDelegate(verifySSL: config.verifySSL)
         let session = URLSession(configuration: sessionConfiguration, delegate: delegate, delegateQueue: nil)
         let semaphore = DispatchSemaphore(value: 0)
-        var body = Data()
-        var statusCode = 0
-        var requestError: Error?
+        let responseBox = HTTPResponseBox()
         let task = session.dataTask(with: request) { data, response, error in
-            body = data ?? Data()
-            statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            requestError = error
+            responseBox.set(
+                data: data ?? Data(),
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                error: error
+            )
             semaphore.signal()
         }
         task.resume()
-        let waitResult = semaphore.wait(timeout: .now() + Double(config.timeoutSecs) + 1)
-        if waitResult == .timedOut {
-            task.cancel()
-            session.invalidateAndCancel()
-            return .failure(AppError(message: "连接超时"))
+        let deadline = Date().addingTimeInterval(Double(config.timeoutSecs) + 1)
+        while semaphore.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
+            if !shouldContinue() {
+                task.cancel()
+                session.invalidateAndCancel()
+                return .failure(AppError(message: "检查已停止"))
+            }
+            if Date() >= deadline {
+                task.cancel()
+                session.invalidateAndCancel()
+                return .failure(AppError(message: "连接超时"))
+            }
         }
         session.finishTasksAndInvalidate()
-        if let redirectLocation = delegate.redirectLocation {
+        let response = responseBox.value()
+        if let redirectLocation = delegate.redirectLocation() {
             return .success(HTTPResult(
-                statusCode: statusCode == 0 ? 302 : statusCode,
-                body: body,
+                statusCode: response.statusCode == 0 ? 302 : response.statusCode,
+                body: response.body,
                 redirectLocation: redirectLocation
             ))
         }
-        if let requestError {
+        if let requestError = response.error {
             return .failure(AppError(message: connectionError(requestError)))
         }
-        if statusCode == 0 {
+        if response.statusCode == 0 {
             return .failure(AppError(message: "连接中断"))
         }
-        return .success(HTTPResult(statusCode: statusCode, body: body, redirectLocation: delegate.redirectLocation))
+        return .success(HTTPResult(statusCode: response.statusCode, body: response.body, redirectLocation: delegate.redirectLocation()))
     }
 
     private static func connectionError(_ error: Error) -> String {
@@ -784,12 +957,20 @@ private func routeLabel(_ route: String) -> String {
     }
 }
 
+func routeNames(for mode: ProxyMode) -> [String] {
+    switch mode {
+    case .auto: return ["direct", "proxy"]
+    case .direct: return ["direct"]
+    case .proxy: return ["proxy"]
+    }
+}
+
 func configFingerprint(_ config: AppConfig) -> String {
     guard let data = try? JSONEncoder().encode(config) else { return "" }
     return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
-final class LogStore {
+final class LogStore: @unchecked Sendable {
     private let paths: AppPaths
     private let lock = NSLock()
 
@@ -831,29 +1012,26 @@ final class LogStore {
     }
 }
 
-final class AutoLoginEngine {
+final class AutoLoginEngine: @unchecked Sendable {
     private let store: AppStore
     private let logger: LogStore
-    private let networkProvider: () -> [WiFiNetwork]
-    private let permissionProvider: () -> Bool
+    private let snapshot: EngineSnapshot
+    private let cancellation = CancellationSignal()
     private let queue = DispatchQueue(label: "com.nowaywastaken.csustautologin.engine", qos: .utility)
     private var state: AppState
     private var running = false
     private var pending = false
     private var scheduled = false
-    private var stopped = false
-    var onUpdate: ((AppState, Bool) -> Void)?
+    var onUpdate: (@Sendable (AppState, Bool) -> Void)?
 
     init(
         store: AppStore,
-        networkProvider: @escaping () -> [WiFiNetwork],
-        permissionProvider: @escaping () -> Bool,
-        onUpdate: ((AppState, Bool) -> Void)? = nil
+        snapshot: EngineSnapshot,
+        onUpdate: (@Sendable (AppState, Bool) -> Void)? = nil
     ) {
         self.store = store
         self.logger = LogStore(paths: store.paths)
-        self.networkProvider = networkProvider
-        self.permissionProvider = permissionProvider
+        self.snapshot = snapshot
         self.state = store.loadState()
         self.onUpdate = onUpdate
     }
@@ -872,7 +1050,7 @@ final class AutoLoginEngine {
 
     func checkNow() {
         queue.async { [weak self] in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.cancellation.isCancelled() else { return }
             self.pending = false
             guard !self.running else { self.pending = true; return }
             self.running = true
@@ -883,23 +1061,20 @@ final class AutoLoginEngine {
     }
 
     func stop() {
-        queue.sync {
-            stopped = true
-            pending = false
-        }
+        cancellation.cancel()
     }
 
     private func requestLocked() {
-        guard !stopped else { return }
+        guard !cancellation.isCancelled() else { return }
         pending = true
         schedulePendingIfNeeded()
     }
 
     private func schedulePendingIfNeeded() {
-        guard !stopped, !running, pending, !scheduled else { return }
+        guard !cancellation.isCancelled(), !running, pending, !scheduled else { return }
         scheduled = true
         queue.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.cancellation.isCancelled() else { return }
             self.scheduled = false
             guard self.pending, !self.running else { return }
             self.pending = false
@@ -918,7 +1093,7 @@ final class AutoLoginEngine {
         }
         var attempt: UInt32 = 0
 
-        while !stopped {
+        while !cancellation.isCancelled() {
             let config: AppConfig
             switch store.effectiveConfig() {
             case .failure(let error):
@@ -936,7 +1111,8 @@ final class AutoLoginEngine {
                 state.notified = false
             }
 
-            guard permissionProvider() else {
+            let current = snapshot.read()
+            guard current.permissionAuthorized else {
                 state.network = ""
                 state.route = ""
                 state.attempt = 0
@@ -944,8 +1120,7 @@ final class AutoLoginEngine {
                 return
             }
 
-            let networks = networkProvider()
-            guard let network = selectNetwork(config, networks) else {
+            guard let network = selectNetwork(config, current.networks) else {
                 state.network = ""
                 state.route = ""
                 state.attempt = 0
@@ -970,7 +1145,7 @@ final class AutoLoginEngine {
                 state.route = ""
                 record(phase: "waiting_ip", detail: "已连接校园 Wi‑Fi，等待系统分配 IPv4 地址。")
                 if attempt >= config.retryAttempts { return }
-                Thread.sleep(forTimeInterval: Double(config.retryIntervalSecs))
+                if cancellation.wait(for: Double(config.retryIntervalSecs)) { return }
                 continue
             }
             let loginIP = config.autoDetectIP ? detectedIP : config.wlanUserIP
@@ -979,8 +1154,10 @@ final class AutoLoginEngine {
             store.saveState(state)
             publish(state: state, shouldNotify: false)
 
-            let outcome = LoginService.login(config: config, ip: loginIP) { [networkProvider] in
-                selectNetwork(config, networkProvider())?.key == key
+            let outcome = LoginService.login(config: config, ip: loginIP) { [snapshot, cancellation] in
+                guard !cancellation.isCancelled() else { return false }
+                let current = snapshot.read()
+                return current.permissionAuthorized && selectNetwork(config, current.networks)?.key == key
             }
             switch outcome.0 {
             case .online:
@@ -1001,7 +1178,7 @@ final class AutoLoginEngine {
                 continue
             }
             if attempt >= config.retryAttempts { return }
-            Thread.sleep(forTimeInterval: Double(config.retryIntervalSecs))
+            if cancellation.wait(for: Double(config.retryIntervalSecs)) { return }
         }
     }
 
@@ -1023,7 +1200,8 @@ final class AutoLoginEngine {
     }
 }
 
-final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
+@MainActor
+final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
     static let shared = AppModel()
 
     @Published private(set) var config: AppConfig
@@ -1037,6 +1215,7 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     private let store: AppStore
     private let locationManager = CLLocationManager()
     private let wifiMonitor = WiFiMonitor()
+    private let engineSnapshot = EngineSnapshot()
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.csustautologin.path")
     private var fallbackTimer: Timer?
@@ -1045,10 +1224,9 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     private lazy var engine: AutoLoginEngine = {
         AutoLoginEngine(
             store: store,
-            networkProvider: { [weak self] in self?.wifiMonitor.networks() ?? [] },
-            permissionProvider: { [weak self] in self?.isLocationAuthorized ?? false },
+            snapshot: engineSnapshot,
             onUpdate: { [weak self] state, shouldNotify in
-                DispatchQueue.main.async {
+                Task { @MainActor [weak self] in
                     self?.apply(state: state, shouldNotify: shouldNotify)
                 }
             }
@@ -1079,12 +1257,16 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         refreshLaunchStatus()
         if autoStartEnabled { registerLaunchAtLogin() }
 
-        wifiMonitor.onChange = { [weak self] in self?.requestCheck() }
+        wifiMonitor.onChange = { [weak self] in
+            Task { @MainActor [weak self] in self?.requestCheck() }
+        }
         wifiMonitor.start()
-        pathMonitor.pathUpdateHandler = { [weak self] _ in self?.requestCheck() }
+        pathMonitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor [weak self] in self?.requestCheck() }
+        }
         pathMonitor.start(queue: pathQueue)
         fallbackTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.requestCheck()
+            Task { @MainActor [weak self] in self?.requestCheck() }
         }
         requestLocationPermissionIfNeeded()
         engine.start()
@@ -1108,13 +1290,13 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     func requestCheck() {
-        engine.request()
         refreshNetworks()
+        engine.request()
     }
 
     func checkNow() {
-        engine.checkNow()
         refreshNetworks()
+        engine.checkNow()
     }
 
     func saveConfig(_ newConfig: AppConfig) {
@@ -1154,19 +1336,22 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func runDoctor() {
         diagnosticText = "正在诊断…"
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            let currentNetworks = self.wifiMonitor.networks()
+        let currentNetworks = wifiMonitor.networks()
+        let configResult = store.effectiveConfig()
+        DispatchQueue.global(qos: .utility).async { [weak self, currentNetworks, configResult] in
             var lines = currentNetworks.map {
                 "网卡 \($0.interfaceName)：IPv4=\($0.ip ?? "未分配")，SSID=\($0.ssid ?? "不可读取")，BSSID=\($0.bssid ?? "不可读取")"
             }
-            switch self.store.effectiveConfig() {
+            switch configResult {
             case .failure(let error):
                 lines.append("配置：\(error.message)")
             case .success(let config):
+                if let warning = config.transportWarning {
+                    lines.append(warning)
+                }
                 if let network = selectNetwork(config, currentNetworks) {
                     lines.append("匹配校园网络：\(network.key)")
-                    for route in self.routeNames(for: config.proxyMode) {
+                    for route in routeNames(for: config.proxyMode) {
                         switch LoginService.probe(config: config, route: route) {
                         case .success(let status): lines.append("\(routeLabel(route))：服务器可达，HTTP \(status)")
                         case .failure(let error): lines.append("\(routeLabel(route))：\(error.message)")
@@ -1176,7 +1361,9 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
                     lines.append("当前不在配置的校园网络，未发送认证请求。")
                 }
             }
-            DispatchQueue.main.async { self.diagnosticText = lines.joined(separator: "\n") }
+            Task { @MainActor [weak self, lines] in
+                self?.diagnosticText = lines.joined(separator: "\n")
+            }
         }
     }
 
@@ -1232,10 +1419,8 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     private func refreshNetworks() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.networks = self.wifiMonitor.networks()
-        }
+        networks = wifiMonitor.networks()
+        engineSnapshot.update(networks: networks, permissionAuthorized: isLocationAuthorized)
     }
 
     private func requestNotificationPermission() {
@@ -1262,16 +1447,9 @@ final class AppModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         refreshLaunchStatus()
     }
 
-    private func routeNames(for mode: ProxyMode) -> [String] {
-        switch mode {
-        case .auto: return ["direct", "proxy"]
-        case .direct: return ["direct"]
-        case .proxy: return ["proxy"]
-        }
-    }
-
     func handleAuthorizationChange() {
         permissionStatus = locationManager.authorizationStatus
+        refreshNetworks()
         if permissionStatus == .authorized {
             NSApp.setActivationPolicy(.accessory)
             requestCheck()
@@ -1367,6 +1545,12 @@ struct SettingsView: View {
                 if draft.proxyMode != .direct {
                     TextField("代理地址", text: $draft.proxyURL)
                 }
+                Toggle("允许不安全认证传输", isOn: $draft.allowInsecureTransport)
+                if draft.allowInsecureTransport, let warning = draft.transportWarning {
+                    Text(warning)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Toggle("验证服务器证书", isOn: $draft.verifySSL)
             }
             Section("重试") {
@@ -1432,7 +1616,10 @@ struct SettingsView: View {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var instanceLock: AppInstanceLock?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if CommandLine.arguments.contains("--self-test") {
             SelfTest.run()
@@ -1444,11 +1631,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
             return
         }
+        do {
+            let paths = AppPaths()
+            try ensurePrivateDirectory(paths.data)
+            instanceLock = try AppInstanceLock(path: paths.data.appendingPathComponent("run.lock"))
+        } catch AppInstanceLockError.alreadyRunning {
+            NSLog("校园网自动登录已在运行，退出重复实例。")
+            NSApp.terminate(nil)
+            return
+        } catch {
+            NSLog("无法取得校园网自动登录运行锁：%@", error.localizedDescription)
+            NSApp.terminate(nil)
+            return
+        }
         AppModel.shared.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         AppModel.shared.stop()
+    }
+}
+
+private final class LockedString: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = ""
+
+    func set(_ value: String) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func get() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+private final class LockedAppState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = AppState()
+
+    func set(_ value: AppState) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func get() -> AppState {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 
@@ -1466,6 +1700,7 @@ enum SelfTest {
             autoDetectIP: true,
             wlanUserIP: "",
             verifySSL: false,
+            allowInsecureTransport: true,
             proxyMode: .direct,
             proxyURL: "http://127.0.0.1:7890",
             timeoutSecs: 1,
@@ -1483,17 +1718,138 @@ enum SelfTest {
         precondition(parseResponse("dr1003({\"msg\":\"密码错误\"});") == .credentials)
         precondition(parseResponse("dr1003({\"msg\":\"10.183.0.2 已经在线！\"});") == .online)
         precondition(config.validationError() == nil)
-        httpLogin()
+        var insecure = config
+        insecure.serverURL = "http://127.0.0.1/login"
+        insecure.allowInsecureTransport = false
+        precondition(insecure.validationError() != nil)
+        let blockedInsecure = insecure
+        insecure.allowInsecureTransport = true
+        precondition(insecure.validationError() == nil)
+        precondition(insecure.transportWarning != nil)
+        let insecureOutcome = LoginService.login(config: blockedInsecure, ip: "10.183.0.2") {
+            preconditionFailure("insecure transport must not reach the network")
+        }
+        if case .retry = insecureOutcome.0 {
+            // expected
+        } else {
+            preconditionFailure("insecure transport was not rejected")
+        }
+        storeMigrationAndPersistence()
+        engineCancellationAndMutex()
+        httpLogin(proxy: false)
+        httpLogin(proxy: true)
         print("CampusAutoLogin self-test passed")
     }
 
-    private static func httpLogin() {
+    private static func storeMigrationAndPersistence() {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("csust-self-test-\(UUID().uuidString)")
+        let data = root.appendingPathComponent("data", isDirectory: true)
+        let paths = AppPaths(
+            data: data,
+            legacyConfig: data.appendingPathComponent("config.json"),
+            legacyState: data.appendingPathComponent("state.json"),
+            logs: root.appendingPathComponent("logs", isDirectory: true)
+        )
+        let suiteName = "csust-self-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try! FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
+
+        var config = AppConfig.default
+        config.username = "migrated-account"
+        config.password = "migrated-password"
+        config.serverURL = "https://example.org/login"
+        try! JSONEncoder().encode(config).write(to: paths.legacyConfig)
+        var legacyState = AppState()
+        legacyState.phase = "online"
+        try! JSONEncoder().encode(legacyState).write(to: paths.legacyState)
+
+        let store = AppStore(defaults: defaults, paths: paths)
+        precondition(store.config() == .success(config))
+        precondition(defaults.data(forKey: configDefaultsKey) != nil)
+        try! store.saveConfig(config)
+        store.saveState(legacyState)
+        let reloaded = AppStore(defaults: defaults, paths: paths)
+        precondition(reloaded.config() == .success(config))
+        precondition(reloaded.loadState() == legacyState)
+    }
+
+    private static func engineCancellationAndMutex() {
+        let lockRoot = FileManager.default.temporaryDirectory.appendingPathComponent("csust-lock-test-\(UUID().uuidString)")
+        try! FileManager.default.createDirectory(at: lockRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: lockRoot) }
+        let lockPath = lockRoot.appendingPathComponent("run.lock")
+        do {
+            let first = try! AppInstanceLock(path: lockPath)
+            do {
+                _ = try AppInstanceLock(path: lockPath)
+                preconditionFailure("second instance acquired the run lock")
+            } catch AppInstanceLockError.alreadyRunning {
+                // expected
+            } catch {
+                preconditionFailure("unexpected run lock error: \(error)")
+            }
+            _ = first
+        }
+        _ = try! AppInstanceLock(path: lockPath)
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("csust-engine-test-\(UUID().uuidString)")
+        let data = root.appendingPathComponent("data", isDirectory: true)
+        let paths = AppPaths(
+            data: data,
+            legacyConfig: data.appendingPathComponent("config.json"),
+            legacyState: data.appendingPathComponent("state.json"),
+            logs: root.appendingPathComponent("logs", isDirectory: true)
+        )
+        let suiteName = "csust-engine-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try! FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
+        var config = AppConfig.default
+        config.username = "engine-account"
+        config.password = "engine-password"
+        config.retryIntervalSecs = 3600
+        let store = AppStore(defaults: defaults, paths: paths)
+        try! store.saveConfig(config)
+        let permissionSnapshot = EngineSnapshot()
+        permissionSnapshot.update(networks: [], permissionAuthorized: false)
+        let permissionWaiting = DispatchSemaphore(value: 0)
+        do {
+            let permissionEngine = AutoLoginEngine(store: store, snapshot: permissionSnapshot) { state, _ in
+                if state.phase == "permission" { permissionWaiting.signal() }
+            }
+            permissionEngine.start()
+            precondition(permissionWaiting.wait(timeout: .now() + 3) == .success)
+            permissionEngine.stop()
+        }
+        let snapshot = EngineSnapshot()
+        snapshot.update(networks: [WiFiNetwork(interfaceName: "en0", ssid: config.ssid, bssid: nil, ip: nil)], permissionAuthorized: true)
+        let observed = LockedAppState()
+        let waiting = DispatchSemaphore(value: 0)
+        let engine = AutoLoginEngine(store: store, snapshot: snapshot) { state, _ in
+            observed.set(state)
+            if state.phase == "waiting_ip" { waiting.signal() }
+        }
+        engine.start()
+        precondition(waiting.wait(timeout: .now() + 3) == .success)
+        precondition(observed.get().phase == "waiting_ip")
+        let started = Date()
+        engine.stop()
+        precondition(Date().timeIntervalSince(started) < 1)
+    }
+
+    private static func httpLogin(proxy: Bool) {
         let queue = DispatchQueue(label: "com.nowaywastaken.csustautologin.self-test-server")
         let listener = try! NWListener(using: .tcp, on: .any)
         let ready = DispatchSemaphore(value: 0)
         let requestDone = DispatchSemaphore(value: 0)
-        let requestLock = NSLock()
-        var requestText = ""
+        let requestText = LockedString()
         listener.stateUpdateHandler = { state in
             if case .ready = state { ready.signal() }
         }
@@ -1501,9 +1857,7 @@ enum SelfTest {
             connection.start(queue: queue)
             connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, _, _ in
                 if let data, let text = String(data: data, encoding: .utf8) {
-                    requestLock.lock()
-                    requestText = text
-                    requestLock.unlock()
+                    requestText.set(text)
                 }
                 let body = Data(#"{"result":1}"#.utf8)
                 let header = Data("HTTP/1.1 200 OK\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
@@ -1519,14 +1873,20 @@ enum SelfTest {
         var config = AppConfig.default
         config.username = "account"
         config.password = "p&密+?#"
-        config.serverURL = "http://127.0.0.1:\(port)/login"
-        config.proxyMode = .direct
+        config.allowInsecureTransport = true
+        config.verifySSL = false
+        if proxy {
+            config.serverURL = "http://127.0.0.1:9/login"
+            config.proxyURL = "http://127.0.0.1:\(port)"
+            config.proxyMode = .proxy
+        } else {
+            config.serverURL = "http://127.0.0.1:\(port)/login"
+            config.proxyMode = .direct
+        }
         let result = LoginService.login(config: config, ip: "10.183.0.2") { true }
         precondition(result.0 == .online)
         precondition(requestDone.wait(timeout: .now() + 3) == .success)
-        requestLock.lock()
-        let captured = requestText
-        requestLock.unlock()
+        let captured = requestText.get()
         precondition(captured.contains("user_password=p%26"))
         precondition(captured.contains("wlan_user_ip=10.183.0.2"))
         precondition(!captured.contains("p&密+?#"))

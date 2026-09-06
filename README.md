@@ -27,6 +27,7 @@ bash install.sh uninstall
 - CoreWLAN 读取 SSID/BSSID；定位权限不可用或系统返回 `<redacted>` 时拒绝自动认证，不用 IP 前缀猜测 SSID。
 - 只接受目标 SSID 的真实 Wi‑Fi 接口和配置中的校园 IPv4 前缀（默认 `10.161.`、`10.183.`）。
 - 自动模式先直连，连接失败后尝试 HTTP/HTTPS 代理；也支持仅直连或仅代理。
+- 默认只允许 HTTPS 且验证认证服务器证书；“允许不安全认证传输”必须由用户显式打开，并会显示 HTTP/证书校验警告。
 - 每次请求前后重新确认网络；切换 SSID、接口或 IPv4 会停止当前认证轮次。
 - 连接失败有限重试；连续失败满 2 分钟通知一次，账号密码错误立即暂停自动尝试，修改配置或点击立即检查后恢复。
 - 日志写入 `~/Library/Logs/csust-auto-login`，保留 7 天；不保存原始响应、密码或认证查询串。
@@ -47,3 +48,10 @@ codesign --verify --deep --strict target/CampusAutoLogin.app
 ```
 
 `build.sh` 会编译 App、进行本机 ad-hoc 签名，并运行内置 self-test。`src/` 中的 Rust 实现保留作协议和迁移参考，不再参与 App 构建或后台运行。
+
+验证还包括 Swift 6 严格并发检查、配置迁移/持久化、权限与引擎取消、跨进程运行锁、直连/代理请求，以及安装替换回滚：
+
+```sh
+bash install.sh self-test
+cargo test --all-targets
+```

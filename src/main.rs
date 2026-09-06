@@ -241,6 +241,9 @@ fn login(
     ip: &str,
     mut still_connected: impl FnMut() -> bool,
 ) -> (Outcome, String) {
+    if let Err(error) = config.validate() {
+        return (Outcome::Retry(error), String::new());
+    }
     let account = format!(",0,{}", config.username);
     let params = [
         ("callback", "dr1003"),

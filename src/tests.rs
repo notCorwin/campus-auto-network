@@ -31,6 +31,7 @@ fn test_config() -> Config {
     Config {
         username: "test-account".into(),
         password: " test&密码+?# ".into(),
+        allow_insecure_transport: true,
         timeout_secs: 1,
         ..Config::default()
     }
@@ -73,6 +74,7 @@ fn server(responses: Vec<&str>) -> (String, Receiver<String>, JoinHandle<()>) {
                     Err(error) => panic!("mock server accept: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -475,6 +477,15 @@ fn persisted_notification_and_configuration_rules() {
     assert!(invalid.validate().is_err());
     invalid.ip_prefixes = vec!["10.161.".into()];
     invalid.server_url = "https://example.org/login?user_password=secret".into();
+    assert!(invalid.validate().is_err());
+    invalid.server_url = "http://example.org/login".into();
+    invalid.allow_insecure_transport = false;
+    assert!(invalid.validate().is_err());
+    invalid.allow_insecure_transport = true;
+    assert!(invalid.validate().is_ok());
+    invalid.server_url = "https://example.org/login".into();
+    invalid.verify_ssl = false;
+    invalid.allow_insecure_transport = false;
     assert!(invalid.validate().is_err());
 
     let unconfigured = TempHome::new();
