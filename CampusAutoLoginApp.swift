@@ -5,9 +5,7 @@ import CoreWLAN
 import CryptoKit
 import Darwin
 import Foundation
-import LocalAuthentication
 import Network
-import Security
 import ServiceManagement
 import SwiftUI
 import UserNotifications
@@ -18,7 +16,6 @@ private let campusLoginURL = URL(string: "https://login.csust.edu.cn:802/eportal
 private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
 private let autoStartDefaultsKey = "autoStartEnabled"
-private let keychainService = "com.nowaywastaken.csustautologin"
 
 struct AppError: Error, LocalizedError, Sendable, Equatable {
     let message: String
@@ -62,6 +59,7 @@ struct AppConfig: Codable, Equatable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(username, forKey: .username)
+        try container.encode(password, forKey: .password)
         try container.encode(timeoutSecs, forKey: .timeoutSecs)
     }
 
@@ -103,98 +101,6 @@ private func ensurePrivateDirectory(_ url: URL) throws {
     let fileManager = FileManager.default
     try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
     try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
-}
-
-final class KeychainStore: @unchecked Sendable {
-    private let service: String
-    private let useSystemKeychain: Bool
-    private let account = "campus-password"
-    private var memoryPassword: String?
-
-    init(service: String = keychainService, useSystemKeychain: Bool = true) {
-        self.service = service
-        self.useSystemKeychain = useSystemKeychain
-    }
-
-    func read() throws -> String? {
-        if !useSystemKeychain { return memoryPassword }
-        return try read(using: keychainQuery())
-    }
-
-    private func read(using query: [String: Any]) throws -> String? {
-        var query = query
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess else { throw KeychainError.status(status) }
-        guard let data = result as? Data else { throw KeychainError.invalidData }
-        return String(data: data, encoding: .utf8)
-    }
-
-    private func keychainQuery() -> [String: Any] {
-        let context = LAContext()
-        context.interactionNotAllowed = true
-        return [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecUseAuthenticationContext as String: context
-        ]
-    }
-
-    func save(_ password: String) throws {
-        if !useSystemKeychain {
-            memoryPassword = password
-            return
-        }
-        let query = keychainQuery()
-        var existingQuery = query
-        existingQuery[kSecReturnAttributes as String] = true
-        let existingStatus = SecItemCopyMatching(existingQuery as CFDictionary, nil)
-        guard existingStatus == errSecItemNotFound else {
-            guard existingStatus == errSecSuccess else {
-                throw KeychainError.status(existingStatus)
-            }
-            return
-        }
-
-        let data = Data(password.utf8)
-        var item = query
-        item[kSecValueData as String] = data
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        let addStatus = SecItemAdd(item as CFDictionary, nil)
-        guard addStatus == errSecSuccess || addStatus == errSecDuplicateItem else {
-            throw KeychainError.status(addStatus)
-        }
-    }
-
-    func remove() throws {
-        if !useSystemKeychain {
-            memoryPassword = nil
-            return
-        }
-        let query = keychainQuery()
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainError.status(status)
-        }
-    }
-
-    enum KeychainError: Error, LocalizedError {
-        case status(OSStatus)
-        case invalidData
-
-        var errorDescription: String? {
-            switch self {
-            case .status(let status):
-                return SecCopyErrorMessageString(status, nil) as String? ?? "Keychain 操作失败。"
-            case .invalidData:
-                return "Keychain 中的密码数据无效。"
-            }
-        }
-    }
 }
 
 enum AppInstanceLockError: Error, LocalizedError {
@@ -275,7 +181,6 @@ final class EngineSnapshot: @unchecked Sendable {
 
 final class AppStore: @unchecked Sendable {
     private let defaults: UserDefaults
-    private let keychain: KeychainStore
     let paths: AppPaths
     private let lock = NSLock()
     private var storedConfig: AppConfig
@@ -284,53 +189,45 @@ final class AppStore: @unchecked Sendable {
 
     init(
         defaults: UserDefaults = .standard,
-        paths: AppPaths = AppPaths(),
-        keychain: KeychainStore = KeychainStore()
+        paths: AppPaths = AppPaths()
     ) {
         self.defaults = defaults
-        self.keychain = keychain
         self.paths = paths
+        let legacyPasswordURL = paths.data.appendingPathComponent("password")
 
-        let loadedConfig: AppConfig
-        let loadedFromLegacy: Bool
+        var loadedConfig: AppConfig
         if let data = defaults.data(forKey: configDefaultsKey) {
             do {
                 loadedConfig = try JSONDecoder().decode(AppConfig.self, from: data)
-                loadedFromLegacy = false
                 configError = nil
             } catch {
                 loadedConfig = .default
-                loadedFromLegacy = false
                 configError = "配置格式错误，无法读取已保存设置。"
             }
         } else if let data = try? Data(contentsOf: paths.legacyConfig) {
             do {
                 loadedConfig = try JSONDecoder().decode(AppConfig.self, from: data)
-                loadedFromLegacy = true
                 configError = nil
             } catch {
                 loadedConfig = .default
-                loadedFromLegacy = true
                 configError = "旧配置格式错误，无法完成迁移。"
             }
         } else {
             loadedConfig = .default
-            loadedFromLegacy = false
             configError = nil
         }
 
-        var sanitizedConfig = loadedConfig
-        sanitizedConfig.password = ""
-        storedConfig = sanitizedConfig
-        if !loadedConfig.password.isEmpty {
-            try? saveFallbackPassword(loadedConfig.password)
-            try? keychain.save(loadedConfig.password)
+        if configError == nil, loadedConfig.password.isEmpty,
+           let data = try? Data(contentsOf: legacyPasswordURL),
+           let password = String(data: data, encoding: .utf8),
+           !password.isEmpty {
+            loadedConfig.password = password
         }
-        if configError == nil, let encoded = try? JSONEncoder().encode(sanitizedConfig) {
+        storedConfig = loadedConfig
+        if configError == nil, let encoded = try? JSONEncoder().encode(loadedConfig) {
             defaults.set(encoded, forKey: configDefaultsKey)
-            if loadedFromLegacy {
-                try? encoded.write(to: paths.legacyConfig, options: .atomic)
-            }
+            try? FileManager.default.removeItem(at: paths.legacyConfig)
+            try? FileManager.default.removeItem(at: passwordFallbackURL)
         }
     }
 
@@ -340,16 +237,7 @@ final class AppStore: @unchecked Sendable {
         if let configError {
             return .failure(AppError(message: configError))
         }
-        var config = storedConfig
-        if let password = readFallbackPassword(), !password.isEmpty {
-            config.password = password
-        } else if let password = try? keychain.read(), !password.isEmpty {
-            config.password = password
-            try? saveFallbackPassword(password)
-        } else {
-            config.password = ""
-        }
-        return .success(config)
+        return .success(storedConfig)
     }
 
     func effectiveConfig() -> Result<AppConfig, AppError> {
@@ -367,37 +255,13 @@ final class AppStore: @unchecked Sendable {
         guard config.validationError() == nil else {
             throw StoreError.invalidConfig
         }
-        do {
-            try saveFallbackPassword(config.password)
-        } catch {
-            throw StoreError.passwordFile(error.localizedDescription)
-        }
-        try? keychain.save(config.password)
-        var sanitizedConfig = config
-        sanitizedConfig.password = ""
-        let encoded = try JSONEncoder().encode(sanitizedConfig)
+        let encoded = try JSONEncoder().encode(config)
         lock.lock()
         defer { lock.unlock() }
         storedConfig = config
-        storedConfig.password = ""
         configError = nil
         defaults.set(encoded, forKey: configDefaultsKey)
-    }
-
-    private func readFallbackPassword() -> String? {
-        guard let data = try? Data(contentsOf: passwordFallbackURL),
-              let password = String(data: data, encoding: .utf8),
-              !password.isEmpty else { return nil }
-        return password
-    }
-
-    private func saveFallbackPassword(_ password: String) throws {
-        try ensurePrivateDirectory(paths.data)
-        try Data(password.utf8).write(to: passwordFallbackURL, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: NSNumber(value: Int16(0o600))],
-            ofItemAtPath: passwordFallbackURL.path
-        )
+        try? FileManager.default.removeItem(at: passwordFallbackURL)
     }
 
     func loadState() -> AppState {
@@ -445,12 +309,10 @@ final class AppStore: @unchecked Sendable {
 
     enum StoreError: LocalizedError {
         case invalidConfig
-        case passwordFile(String)
 
         var errorDescription: String? {
             switch self {
             case .invalidConfig: return "配置校验失败。"
-            case .passwordFile(let message): return "无法保存校园网密码：\(message)"
             }
         }
     }
@@ -1280,8 +1142,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     override private init() {
-        let useSystemKeychain = !CommandLine.arguments.contains("--self-test")
-        store = AppStore(keychain: KeychainStore(useSystemKeychain: useSystemKeychain))
+        store = AppStore()
         switch store.config() {
         case .success(let config): self.config = config
         case .failure: self.config = .default
@@ -1310,7 +1171,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
         pathMonitor.start(queue: pathQueue)
-        updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { [weak self] _ in
+        updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 3 * 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.checkForUpdates(silently: true) }
         }
         requestLocationPermissionIfNeeded()
@@ -1535,10 +1396,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         return state.detail.isEmpty ? "尚无检查记录" : state.detail
     }
 
-    var statusSymbol: String {
+    var statusEmoji: String {
         permissionStatus == .authorized && !state.checking && state.phase == "online"
-            ? "antenna.radiowaves.left.and.right"
-            : "wifi.slash"
+            ? "🛰️"
+            : "💥"
     }
 
     private func apply(state: AppState, shouldNotify: Bool) {
@@ -1746,8 +1607,8 @@ struct MenuBarLabel: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Image(systemName: model.statusSymbol)
-            .accessibilityLabel(model.state.phase == "online" ? "校园网已连接" : "校园网未连接")
+        Text(model.statusEmoji)
+            .accessibilityLabel(model.statusEmoji == "🛰️" ? "校园网已连接" : "校园网未连接")
     }
 }
 
@@ -1864,7 +1725,7 @@ enum SelfTest {
         precondition(parseResponse("dr1003({\"msg\":\"10.183.0.2 已经在线！\"});") == .online)
         precondition(config.validationError() == nil)
         let encodedConfig = try! JSONEncoder().encode(config)
-        precondition(!String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
+        precondition(String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
         var changedConfig = config
         changedConfig.password = "different"
         precondition(configFingerprint(config) != configFingerprint(changedConfig))
@@ -1946,24 +1807,21 @@ enum SelfTest {
             password: "migrated-password",
             timeoutSecs: 15
         )
-        let keychain = KeychainStore(service: "csust-self-test", useSystemKeychain: false)
-        defer { try? keychain.remove() }
         var legacyState = AppState()
         legacyState.phase = "online"
         legacyState.checking = true
         try! JSONEncoder().encode(legacyState).write(to: paths.legacyState)
 
-        let store = AppStore(defaults: defaults, paths: paths, keychain: keychain)
+        let store = AppStore(defaults: defaults, paths: paths)
         precondition(store.config() == .success(expectedConfig))
         precondition(defaults.data(forKey: configDefaultsKey) != nil)
-        precondition(try! keychain.read() == expectedConfig.password)
-        precondition(!String(decoding: defaults.data(forKey: configDefaultsKey)!, as: UTF8.self).contains(expectedConfig.password))
-        precondition(!String(decoding: try! Data(contentsOf: paths.legacyConfig), as: UTF8.self).contains(expectedConfig.password))
+        precondition(String(decoding: defaults.data(forKey: configDefaultsKey)!, as: UTF8.self).contains(expectedConfig.password))
+        precondition(!FileManager.default.fileExists(atPath: paths.legacyConfig.path))
         precondition(store.effectiveConfig() == .success(expectedConfig))
         try! store.saveConfig(expectedConfig)
-        precondition(!String(decoding: defaults.data(forKey: configDefaultsKey)!, as: UTF8.self).contains(expectedConfig.password))
+        precondition(String(decoding: defaults.data(forKey: configDefaultsKey)!, as: UTF8.self).contains(expectedConfig.password))
         store.saveState(legacyState)
-        let reloaded = AppStore(defaults: defaults, paths: paths, keychain: keychain)
+        let reloaded = AppStore(defaults: defaults, paths: paths)
         precondition(reloaded.config() == .success(expectedConfig))
         var expectedState = legacyState
         expectedState.checking = false
@@ -2007,9 +1865,7 @@ enum SelfTest {
         var config = AppConfig.default
         config.username = "engine-account"
         config.password = "engine-password"
-        let keychain = KeychainStore(service: "csust-engine-test", useSystemKeychain: false)
-        defer { try? keychain.remove() }
-        let store = AppStore(defaults: defaults, paths: paths, keychain: keychain)
+        let store = AppStore(defaults: defaults, paths: paths)
         try! store.saveConfig(config)
         let permissionSnapshot = EngineSnapshot()
         permissionSnapshot.update(networks: [], permissionAuthorized: false)

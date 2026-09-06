@@ -17,9 +17,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typechec
   -framework CoreLocation \
   -framework CoreWLAN \
   -framework CryptoKit \
-  -framework LocalAuthentication \
   -framework Network \
-  -framework Security \
   -framework ServiceManagement \
   -framework UserNotifications \
   CampusAutoLoginApp.swift AppUpdater.swift
@@ -30,9 +28,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
   -framework CoreLocation \
   -framework CoreWLAN \
   -framework CryptoKit \
-  -framework LocalAuthentication \
   -framework Network \
-  -framework Security \
   -framework ServiceManagement \
   -framework UserNotifications \
   -o "$EXECUTABLE" CampusAutoLoginApp.swift AppUpdater.swift
