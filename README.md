@@ -14,7 +14,7 @@ App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注
 
 `系统设置 → 隐私与安全性 → 定位服务 → 系统服务 → 网络与无线`
 
-菜单栏提供立即检查、诊断、设置、登录时自动启动和退出。卸载：
+菜单栏提供立即检查、诊断、设置、更新、登录时自动启动和退出。更新状态会在打开菜单时及每小时自动检查；自动发现新版本只更新菜单状态，点击“有最新版本可用”后才会确认并安装。卸载：
 
 ```sh
 bash install.sh uninstall
@@ -55,3 +55,6 @@ codesign --verify --deep --strict target/CampusAutoLogin.app
 bash install.sh self-test
 cargo test --all-targets
 ```
+
+每次推送会由 GitHub Actions 构建并更新 `autobuild` Release。更新器只接受
+`CampusAutoLogin.app.tar`，会校验 GitHub SHA-256、归档路径、Bundle ID、可执行文件和提交版本；替换失败或新版本无法启动时自动恢复旧 App。

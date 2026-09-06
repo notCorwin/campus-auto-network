@@ -1211,15 +1211,20 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     @Published private(set) var diagnosticText = ""
     @Published private(set) var launchStatus = ""
     @Published private(set) var autoStartEnabled: Bool
+    @Published private(set) var updateStatus = AppUpdateStatus.idle
 
     private let store: AppStore
+    private let updater = AppUpdater()
     private let locationManager = CLLocationManager()
     private let wifiMonitor = WiFiMonitor()
     private let engineSnapshot = EngineSnapshot()
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.csustautologin.path")
     private var fallbackTimer: Timer?
+    private var updateCheckTimer: Timer?
     private var started = false
+    private var isCheckingForUpdate = false
+    private var isInstallingUpdate = false
 
     private lazy var engine: AutoLoginEngine = {
         AutoLoginEngine(
@@ -1268,6 +1273,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         fallbackTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
+        updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 60 * 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.checkForUpdates(silently: true) }
+        }
         requestLocationPermissionIfNeeded()
         engine.start()
         refreshNetworks()
@@ -1284,9 +1292,12 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     func stop() {
         fallbackTimer?.invalidate()
         fallbackTimer = nil
+        updateCheckTimer?.invalidate()
+        updateCheckTimer = nil
         pathMonitor.cancel()
         wifiMonitor.stop()
         engine.stop()
+        updater.cancel()
     }
 
     func requestCheck() {
@@ -1381,6 +1392,85 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             diagnosticText = "登录启动设置失败：\(error.localizedDescription)"
             refreshLaunchStatus()
         }
+    }
+
+    func menuDidOpen() {
+        checkForUpdates(silently: true)
+    }
+
+    func checkForUpdatesNow() {
+        checkForUpdates(silently: false)
+    }
+
+    var updateMenuTitle: String {
+        isInstallingUpdate ? "正在安装更新…" : updateStatus.title
+    }
+
+    var updateActionEnabled: Bool {
+        !isInstallingUpdate && updateStatus.isInteractive
+    }
+
+    private func checkForUpdates(silently: Bool) {
+        guard !isCheckingForUpdate, !isInstallingUpdate else { return }
+        isCheckingForUpdate = true
+        updateStatus = .checking
+        updater.check { [weak self] result in
+            guard let self else { return }
+            isCheckingForUpdate = false
+
+            switch result {
+            case .success(let update):
+                guard let update else {
+                    updateStatus = .latest
+                    if !silently {
+                        showUpdateAlert(title: "已是最新版本", message: "当前已是最新版本。")
+                    }
+                    return
+                }
+                updateStatus = .available(String(update.revision.prefix(7)))
+                if !silently {
+                    presentUpdate(update)
+                }
+            case .failure(let error):
+                updateStatus = .failed
+                if !silently {
+                    showUpdateAlert(title: "检查更新失败", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func presentUpdate(_ update: AppUpdate) {
+        let alert = NSAlert()
+        alert.messageText = "发现校园网自动登录新版本"
+        let revision = update.revision == "unknown"
+            ? ""
+            : "\n构建提交：\(update.revision.prefix(7))"
+        alert.informativeText = "\(update.name)\(revision)\n是否下载并安装？"
+        alert.addButton(withTitle: "更新")
+        alert.addButton(withTitle: "稍后")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        isInstallingUpdate = true
+        updater.downloadAndInstall(update) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                isInstallingUpdate = false
+                updateStatus = .failed
+                showUpdateAlert(title: "安装更新失败", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func showUpdateAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        alert.runModal()
     }
 
     var statusText: String {
@@ -1478,6 +1568,7 @@ struct MenuContent: View {
     var body: some View {
         Text(model.statusText)
             .lineLimit(3)
+            .onAppear { model.menuDidOpen() }
         if !model.state.network.isEmpty {
             Text(model.state.network)
                 .font(.caption)
@@ -1499,6 +1590,9 @@ struct MenuContent: View {
         Text("启动：\(model.launchStatus)")
             .font(.caption)
             .foregroundStyle(.secondary)
+        Divider()
+        Button(model.updateMenuTitle) { model.checkForUpdatesNow() }
+            .disabled(!model.updateActionEnabled)
         Divider()
         Button("退出") { model.quit() }
     }
@@ -1645,10 +1739,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         AppModel.shared.start()
+        signalReadinessIfRequested()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         AppModel.shared.stop()
+    }
+
+    private func signalReadinessIfRequested() {
+        guard let path = ProcessInfo.processInfo.environment["CAMPUS_AUTO_LOGIN_READY_FILE"],
+              !path.isEmpty else {
+            return
+        }
+        FileManager.default.createFile(atPath: path, contents: Data())
     }
 }
 
@@ -1726,6 +1829,7 @@ enum SelfTest {
         insecure.allowInsecureTransport = true
         precondition(insecure.validationError() == nil)
         precondition(insecure.transportWarning != nil)
+        updateParsing()
         let insecureOutcome = LoginService.login(config: blockedInsecure, ip: "10.183.0.2") {
             preconditionFailure("insecure transport must not reach the network")
         }
@@ -1739,6 +1843,52 @@ enum SelfTest {
         httpLogin(proxy: false)
         httpLogin(proxy: true)
         print("CampusAutoLogin self-test passed")
+    }
+
+    private static func updateParsing() {
+        let revision = String(repeating: "a", count: 40)
+        let digest = String(repeating: "0", count: 64)
+        let data = Data(
+            """
+            {
+              "name": "autobuild",
+              "target_commitish": "\(revision)",
+              "body": "",
+              "assets": [{
+                "name": "CampusAutoLogin.app.tar",
+                "browser_download_url": "https://github.com/notCorwin/campus-auto-network/releases/download/autobuild/CampusAutoLogin.app.tar",
+                "digest": "sha256:\(digest)"
+              }]
+            }
+            """.utf8
+        )
+        precondition(AppUpdater.revision(in: "commit \(revision)") == revision)
+        precondition(
+            AppUpdater.archiveAppRoot(
+                from: "CampusAutoLogin.app/Contents/MacOS/CampusAutoLogin"
+            ) == "CampusAutoLogin.app"
+        )
+        precondition(
+            AppUpdater.archiveAppRoot(from: "../CampusAutoLogin.app/Contents") == nil
+        )
+        precondition(
+            AppUpdater.archiveContainsUnsafeEntry(
+                in: "lrwxr-xr-x  0 user  wheel  0 Jan 1 00:00 Link -> /tmp"
+            )
+        )
+        precondition(
+            !AppUpdater.archiveExceedsSizeLimit(
+                in: "-rw-r--r--  0 user  wheel  268435456 Jan 1 00:00 file"
+            )
+        )
+        guard case .success(let update) = AppUpdater.parse(data: data, currentRevision: "development"),
+              let update else {
+            preconditionFailure("release metadata must parse")
+        }
+        precondition(update.revision == revision)
+        guard case .success(nil) = AppUpdater.parse(data: data, currentRevision: revision) else {
+            preconditionFailure("same revision must not update")
+        }
     }
 
     private static func storeMigrationAndPersistence() {

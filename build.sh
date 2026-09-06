@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 
 APP_PATH="$(pwd)/target/CampusAutoLogin.app"
 EXECUTABLE="$APP_PATH/Contents/MacOS/CampusAutoLogin"
+APP_REVISION="${APP_REVISION:-development}"
 
 echo "🔨 正在编译校园网自动登录 App..."
 rm -rf "$APP_PATH"
@@ -18,7 +19,7 @@ swiftc -swift-version 6 -strict-concurrency=complete -parse-as-library -typechec
   -framework Network \
   -framework ServiceManagement \
   -framework UserNotifications \
-  CampusAutoLoginApp.swift
+  CampusAutoLoginApp.swift AppUpdater.swift
 swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
   -framework AppKit \
   -framework SwiftUI \
@@ -28,8 +29,9 @@ swiftc -swift-version 6 -strict-concurrency=complete -O -parse-as-library \
   -framework Network \
   -framework ServiceManagement \
   -framework UserNotifications \
-  -o "$EXECUTABLE" CampusAutoLoginApp.swift
+  -o "$EXECUTABLE" CampusAutoLoginApp.swift AppUpdater.swift
 cp Info.plist "$APP_PATH/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleSourceRevision $APP_REVISION" "$APP_PATH/Contents/Info.plist"
 codesign --force --deep --sign - "$APP_PATH" >/dev/null
 codesign --verify --deep --strict "$APP_PATH"
 
