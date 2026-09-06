@@ -1,6 +1,6 @@
 # 校园网自动登录
 
-macOS 13+ 原生 Swift 菜单栏 App。首次启动申请定位权限，之后通过 CoreWLAN Wi‑Fi 事件、NWPathMonitor 和 60 秒兜底检查监测网络；只有精确匹配目标 SSID 且取得校园 IPv4 后才自动认证。
+macOS 13+ 原生 Swift 菜单栏 App。首次启动申请定位权限，之后通过 CoreWLAN Wi‑Fi 事件和 NWPathMonitor 监测网络；只有精确匹配 `CSUST-Student` 时才自动认证。
 
 ## 安装与使用
 
@@ -8,14 +8,14 @@ macOS 13+ 原生 Swift 菜单栏 App。首次启动申请定位权限，之后�
 bash install.sh
 ```
 
-App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注册登录时启动。首次运行会打开设置页；填写账号、密码、SSID、认证地址和连接方式后保存。
+App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注册登录时启动。首次运行会打开设置页；填写账号、密码和请求超时后保存。
 安装器会先停止同 Bundle ID 的其他运行副本；日常请从 `~/Applications/CampusAutoLogin.app` 启动，避免打开旧下载副本。
 
 若系统没有弹出定位权限提示，在菜单栏 App 中点击“申请定位权限”，或打开：
 
 `系统设置 → 隐私与安全性 → 定位服务 → 系统服务 → 网络与无线`
 
-菜单栏提供立即检查、诊断、设置、更新、登录时自动启动和退出。更新状态会在打开菜单时及每小时自动检查；自动发现新版本只更新菜单状态，点击“有最新版本可用”后才会确认并安装。卸载：
+菜单栏提供立即检查、诊断、设置、更新、登录时自动启动和退出。更新状态会在打开菜单时及每小时自动检查；后台发现新版本后会自动下载、校验并安装，手动检查仍可在确认后安装。卸载：
 
 ```sh
 bash install.sh uninstall
@@ -25,17 +25,18 @@ bash install.sh uninstall
 
 ## 运行规则
 
-- CoreWLAN 读取 SSID/BSSID；定位权限不可用或系统返回 `<redacted>` 时拒绝自动认证，不用 IP 前缀猜测 SSID。
-- 只接受目标 SSID 的真实 Wi‑Fi 接口和配置中的校园 IPv4 前缀（默认 `10.161.`、`10.183.`）。
-- 自动模式先直连，连接失败后尝试 HTTP/HTTPS 代理；也支持仅直连或仅代理。
-- 默认只允许 HTTPS 且验证认证服务器证书；“允许不安全认证传输”必须由用户显式打开，并会显示 HTTP/证书校验警告。
+- CoreWLAN 读取 SSID/BSSID；定位权限不可用或系统返回 `<redacted>` 时拒绝自动认证。
+- 仅将精确匹配 `CSUST-Student` 作为切换到校园网的证据，暂不使用 IPv4 地址段判断。
+- 先直连；直连失败后由 `URLSession` 使用 macOS 系统代理/PAC，兼容有无代理的机器。
+- 认证地址固定为 `https://login.csust.edu.cn:802/eportal/portal/login`，使用系统 TLS 证书校验，避免可配置地址带来的误认证风险。
+- 认证响应成功后还必须满足：可访问 `login.csust.edu.cn`、Cloudflare trace 返回 2xx、Google `generate_204` 返回 204。
 - 每次请求前后重新确认网络；切换 SSID、接口或 IPv4 会停止当前认证轮次。
-- 连接失败有限重试；连续失败满 2 分钟通知一次，账号密码错误立即暂停自动尝试，修改配置或点击立即检查后恢复。
-- 日志写入 `~/Library/Logs/csust-auto-login`，保留 7 天；不保存原始响应、密码或认证查询串。
+- 认证失败会在收到结果后立即重试直到成功；账号密码错误立即暂停自动尝试，修改配置或点击立即检查后恢复。
+- 校园网密码写入 macOS Keychain，其他配置和状态写入 UserDefaults。
 
 ## 配置迁移
 
-首次启动时，App 会将旧版 `~/Library/Application Support/csust-auto-login/config.json` 导入 UserDefaults，字段和默认值保持兼容；旧 JSON 不删除，便于回滚。`CSUST_PASSWORD` 环境变量仍优先于保存的密码。
+首次启动时，App 会将旧版 `~/Library/Application Support/csust-auto-login/config.json` 导入 UserDefaults，并将旧 JSON 中的密码迁移到 macOS Keychain；旧文件会保留但会移除密码字段。
 
 ## 开发与验证
 

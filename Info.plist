@@ -26,11 +26,6 @@
 	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>用于读取当前 Wi‑Fi 名称，以确认是否连接校园网络。</string>
-	<key>NSAppTransportSecurity</key>
-	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-	</dict>
 	<key>NSUserNotificationUsageDescription</key>
 	<string>用于报告自动登录失败、权限问题和恢复状态。</string>
 </dict>

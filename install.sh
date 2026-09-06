@@ -207,6 +207,6 @@ fi
 
 rm -f "$OLD_PLIST"
 SWITCH_STARTED=false
-echo "安装完成（PID ${new_pid}，版本 ${EXPECTED_VERSION}）。App 已启动，网络事件触发、每 60 秒兜底检查一次。"
+echo "安装完成（PID ${new_pid}，版本 ${EXPECTED_VERSION}）。App 已启动，网络事件会触发自动登录。"
 echo "配置：打开菜单栏的“校园网自动登录” → 设置…"
 echo "卸载：bash install.sh uninstall（配置与日志保留）"
