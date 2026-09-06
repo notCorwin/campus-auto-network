@@ -32,11 +32,11 @@ bash install.sh uninstall
 - 认证响应成功后还必须满足：可访问 `login.csust.edu.cn`、Cloudflare trace 返回 2xx、Google `generate_204` 返回 204。
 - 每次请求前后重新确认网络；切换 SSID、接口或 IPv4 会停止当前认证轮次。
 - 认证失败会在收到结果后立即重试直到成功；账号密码错误立即暂停自动尝试，修改配置或点击立即检查后恢复。
-- 校园网密码写入 macOS Keychain，其他配置和状态写入 UserDefaults。
+- 校园网密码优先写入 macOS Keychain；为避免 ad-hoc 构建签名变化触发系统授权，另保留仅当前用户可读（0600）的本地副本，Keychain 访问始终禁止交互式授权。其他配置和状态写入 UserDefaults。
 
 ## 配置迁移
 
-首次启动时，App 会将旧版 `~/Library/Application Support/csust-auto-login/config.json` 导入 UserDefaults，并将旧 JSON 中的密码迁移到 macOS Keychain；旧文件会保留但会移除密码字段。
+首次启动时，App 会将旧版 `~/Library/Application Support/csust-auto-login/config.json` 导入 UserDefaults，并将旧 JSON 中的密码迁移到 macOS Keychain 和当前用户专属的本地副本；旧文件会保留但会移除密码字段。
 
 ## 开发与验证
 
