@@ -27,6 +27,7 @@ bash install.sh uninstall
 
 - CoreWLAN 读取 SSID/BSSID；定位权限不可用或系统返回 `<redacted>` 时拒绝自动认证。
 - 仅将精确匹配 `CSUST-Student` 作为切换到校园网的证据，暂不使用 IPv4 地址段判断。
+- CoreWLAN 和 NWPathMonitor 都使用系统事件；校园网仍连接但互联网路径失效时暂停请求，路径恢复事件到达后立即重新认证。
 - 先直连；直连失败后由 `URLSession` 使用 macOS 系统代理/PAC，兼容有无代理的机器。
 - 认证地址固定为 `https://login.csust.edu.cn:802/eportal/portal/login`，使用系统 TLS 证书校验，避免可配置地址带来的误认证风险。
 - 认证响应成功后还必须满足：可访问 `login.csust.edu.cn`、Cloudflare trace 返回 2xx、Google `generate_204` 返回 204。

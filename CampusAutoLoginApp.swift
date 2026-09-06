@@ -164,18 +164,20 @@ final class EngineSnapshot: @unchecked Sendable {
     private let lock = NSLock()
     private var networks: [WiFiNetwork] = []
     private var permissionAuthorized = false
+    private var pathSatisfied = false
 
-    func update(networks: [WiFiNetwork], permissionAuthorized: Bool) {
+    func update(networks: [WiFiNetwork], permissionAuthorized: Bool, pathSatisfied: Bool = false) {
         lock.lock()
         self.networks = networks
         self.permissionAuthorized = permissionAuthorized
+        self.pathSatisfied = pathSatisfied
         lock.unlock()
     }
 
-    func read() -> (networks: [WiFiNetwork], permissionAuthorized: Bool) {
+    func read() -> (networks: [WiFiNetwork], permissionAuthorized: Bool, pathSatisfied: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return (networks, permissionAuthorized)
+        return (networks, permissionAuthorized, pathSatisfied)
     }
 }
 
@@ -375,7 +377,7 @@ struct AppState: Codable, Equatable, Sendable {
         self.phase = phase
         self.detail = detail
         checkedAt = now
-        if phase == "online" || phase == "outside" {
+        if phase == "online" || phase == "outside" || phase == "offline" {
             failureSince = nil
             notified = false
         }
@@ -1033,6 +1035,13 @@ final class AutoLoginEngine: @unchecked Sendable {
                 state.notified = false
             }
 
+            guard current.pathSatisfied else {
+                state.route = ""
+                state.attempt = 0
+                record(phase: "offline", detail: "已连接校园网，但互联网路径不可用，等待网络恢复。")
+                return
+            }
+
             let config: AppConfig
             switch store.effectiveConfig() {
             case .failure(let error):
@@ -1059,7 +1068,7 @@ final class AutoLoginEngine: @unchecked Sendable {
             let outcome = LoginService.login(config: config, ip: network.ip ?? "") { [snapshot, cancellation] in
                 guard !cancellation.isCancelled() else { return false }
                 let current = snapshot.read()
-                return current.permissionAuthorized && selectNetwork(current.networks)?.key == key
+                return current.permissionAuthorized && current.pathSatisfied && selectNetwork(current.networks)?.key == key
             }
             switch outcome.0 {
             case .online:
@@ -1120,6 +1129,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private let pathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
     private let pathQueue = DispatchQueue(label: "com.nowaywastaken.csustautologin.path")
     private var updateCheckTimer: Timer?
+    private var pathSatisfied = false
     private var started = false
     private var isCheckingForUpdate = false
     private var isInstallingUpdate = false
@@ -1167,8 +1177,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             Task { @MainActor [weak self] in self?.requestCheck() }
         }
         wifiMonitor.start()
-        pathMonitor.pathUpdateHandler = { [weak self] _ in
-            Task { @MainActor [weak self] in self?.requestCheck() }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let pathSatisfied = path.status == .satisfied
+            Task { @MainActor [weak self] in self?.handlePathUpdate(pathSatisfied) }
         }
         pathMonitor.start(queue: pathQueue)
         updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 3 * 60, repeats: true) { [weak self] _ in
@@ -1423,7 +1434,17 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     private func refreshNetworks() {
         networks = wifiMonitor.networks()
-        engineSnapshot.update(networks: networks, permissionAuthorized: isLocationAuthorized)
+        engineSnapshot.update(
+            networks: networks,
+            permissionAuthorized: isLocationAuthorized,
+            pathSatisfied: pathSatisfied
+        )
+    }
+
+    private func handlePathUpdate(_ satisfied: Bool) {
+        pathSatisfied = satisfied
+        refreshNetworks()
+        engine.request()
     }
 
     private func requestNotificationPermission() {
@@ -1878,8 +1899,29 @@ enum SelfTest {
             precondition(permissionWaiting.wait(timeout: .now() + 3) == .success)
             permissionEngine.stop()
         }
+        let offlineSnapshot = EngineSnapshot()
+        offlineSnapshot.update(
+            networks: [WiFiNetwork(interfaceName: "en0", ssid: campusSSID, bssid: nil, ip: nil)],
+            permissionAuthorized: true,
+            pathSatisfied: false
+        )
+        let offlineObserved = LockedAppState()
+        let offlineWaiting = DispatchSemaphore(value: 0)
+        let offlineEngine = AutoLoginEngine(store: store, snapshot: offlineSnapshot) { state, _ in
+            offlineObserved.set(state)
+            if state.phase == "offline" && !state.checking { offlineWaiting.signal() }
+        }
+        offlineEngine.start()
+        precondition(offlineWaiting.wait(timeout: .now() + 3) == .success)
+        precondition(offlineObserved.get().phase == "offline")
+        offlineEngine.stop()
+
         let snapshot = EngineSnapshot()
-        snapshot.update(networks: [WiFiNetwork(interfaceName: "en0", ssid: "other", bssid: nil, ip: nil)], permissionAuthorized: true)
+        snapshot.update(
+            networks: [WiFiNetwork(interfaceName: "en0", ssid: "other", bssid: nil, ip: nil)],
+            permissionAuthorized: true,
+            pathSatisfied: true
+        )
         let observed = LockedAppState()
         let waiting = DispatchSemaphore(value: 0)
         let engine = AutoLoginEngine(store: store, snapshot: snapshot) { state, _ in
