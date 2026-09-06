@@ -109,8 +109,8 @@ enum AppUpdateStatus: Equatable {
 
     var isInteractive: Bool {
         switch self {
-        case .idle, .failed, .available: return true
-        case .checking, .latest: return false
+        case .idle, .failed, .latest, .available: return true
+        case .checking: return false
         }
     }
 }

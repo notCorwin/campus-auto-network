@@ -127,7 +127,11 @@ struct AppConfig: Codable, Equatable, Sendable {
         autoDetectIP = try container.decodeIfPresent(Bool.self, forKey: .autoDetectIP) ?? Self.default.autoDetectIP
         wlanUserIP = try container.decodeIfPresent(String.self, forKey: .wlanUserIP) ?? ""
         verifySSL = try container.decodeIfPresent(Bool.self, forKey: .verifySSL) ?? Self.default.verifySSL
-        allowInsecureTransport = try container.decodeIfPresent(Bool.self, forKey: .allowInsecureTransport) ?? Self.default.allowInsecureTransport
+        // Older configs used verify_ssl=false without the newer explicit
+        // allow_insecure_transport flag. Preserve that deliberate choice once,
+        // while keeping new configs secure by default.
+        allowInsecureTransport = try container.decodeIfPresent(Bool.self, forKey: .allowInsecureTransport)
+            ?? (!container.contains(.allowInsecureTransport) && !verifySSL)
         proxyMode = try container.decodeIfPresent(ProxyMode.self, forKey: .proxyMode) ?? Self.default.proxyMode
         proxyURL = try container.decodeIfPresent(String.self, forKey: .proxyURL) ?? Self.default.proxyURL
         timeoutSecs = try container.decodeIfPresent(UInt64.self, forKey: .timeoutSecs) ?? Self.default.timeoutSecs
@@ -397,11 +401,13 @@ final class AppStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         if let data = defaults.data(forKey: stateDefaultsKey),
-           let state = try? JSONDecoder().decode(AppState.self, from: data) {
+           var state = try? JSONDecoder().decode(AppState.self, from: data) {
+            state.checking = false
             return state
         }
         if let data = try? Data(contentsOf: paths.legacyState),
-           let state = try? JSONDecoder().decode(AppState.self, from: data) {
+           var state = try? JSONDecoder().decode(AppState.self, from: data) {
+            state.checking = false
             if let encoded = try? JSONEncoder().encode(state) {
                 defaults.set(encoded, forKey: stateDefaultsKey)
             }
@@ -498,7 +504,6 @@ struct AppState: Codable, Equatable, Sendable {
         self.phase = phase
         self.detail = detail
         checkedAt = now
-        checking = false
         if phase == "online" || phase == "outside" {
             failureSince = nil
             notified = false
@@ -1086,6 +1091,15 @@ final class AutoLoginEngine: @unchecked Sendable {
     }
 
     private func runCycle(manual: Bool) {
+        state.checking = true
+        state.checkedAt = Int64(Date().timeIntervalSince1970)
+        publish(state: state, shouldNotify: false)
+        defer {
+            state.checking = false
+            store.saveState(state)
+            publish(state: state, shouldNotify: false)
+        }
+
         if manual {
             state.credentialsBlocked = false
             state.failureSince = nil
@@ -1225,6 +1239,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private var started = false
     private var isCheckingForUpdate = false
     private var isInstallingUpdate = false
+    private var manualCheckRequested = false
 
     private lazy var engine: AutoLoginEngine = {
         AutoLoginEngine(
@@ -1306,6 +1321,8 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     func checkNow() {
+        manualCheckRequested = true
+        diagnosticText = "正在检查…"
         refreshNetworks()
         engine.checkNow()
     }
@@ -1342,7 +1359,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     func openLocationSettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices")!
-        NSWorkspace.shared.open(url)
+        if !NSWorkspace.shared.open(url) {
+            diagnosticText = "无法打开定位设置，请在系统设置中手动打开定位服务。"
+        }
     }
 
     func runDoctor() {
@@ -1387,6 +1406,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             }
             autoStartEnabled = enabled
             store.setAutoStartEnabled(enabled)
+            diagnosticText = enabled ? "已启用登录时自动启动。" : "已关闭登录时自动启动。"
             refreshLaunchStatus()
         } catch {
             diagnosticText = "登录启动设置失败：\(error.localizedDescription)"
@@ -1481,6 +1501,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
             default: return "需要定位权限"
             }
         }
+        if state.checking {
+            return "正在检查…"
+        }
         return state.detail.isEmpty ? "尚无检查记录" : state.detail
     }
 
@@ -1495,6 +1518,10 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     private func apply(state: AppState, shouldNotify: Bool) {
         self.state = state
+        if manualCheckRequested && !state.checking {
+            manualCheckRequested = false
+            diagnosticText = state.detail
+        }
         if shouldNotify {
             let content = UNMutableNotificationContent()
             content.title = appDisplayName
@@ -1550,7 +1577,9 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     func openSettingsWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            diagnosticText = "无法打开设置窗口，请从菜单栏重新打开“设置…”。"
+        }
     }
 
     func quit() {
@@ -1574,10 +1603,23 @@ struct MenuContent: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        if !model.diagnosticText.isEmpty {
+            Text(model.diagnosticText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(6)
+                .fixedSize(horizontal: false, vertical: true)
+        }
         Divider()
         Button("立即检查") { model.checkNow() }
         Button("诊断") { model.runDoctor() }
-        Button("设置…") { model.openSettingsWindow() }
+        if #available(macOS 14.0, *) {
+            SettingsLink {
+                Text("设置…")
+            }
+        } else {
+            Button("设置…") { model.openSettingsWindow() }
+        }
         if model.permissionStatus != .authorized {
             Button("申请定位权限") { model.requestLocationPermissionIfNeeded() }
             Button("打开定位设置") { model.openLocationSettings() }
@@ -1731,10 +1773,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             instanceLock = try AppInstanceLock(path: paths.data.appendingPathComponent("run.lock"))
         } catch AppInstanceLockError.alreadyRunning {
             NSLog("校园网自动登录已在运行，退出重复实例。")
+            showStartupError("校园网自动登录已经在运行。请使用菜单栏中的现有图标。")
             NSApp.terminate(nil)
             return
         } catch {
             NSLog("无法取得校园网自动登录运行锁：%@", error.localizedDescription)
+            showStartupError("无法启动校园网自动登录：\(error.localizedDescription)")
             NSApp.terminate(nil)
             return
         }
@@ -1752,6 +1796,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         FileManager.default.createFile(atPath: path, contents: Data())
+    }
+
+    private func showStartupError(_ message: String) {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = appDisplayName
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        alert.runModal()
     }
 }
 
@@ -1912,19 +1966,31 @@ enum SelfTest {
         config.username = "migrated-account"
         config.password = "migrated-password"
         config.serverURL = "https://example.org/login"
-        try! JSONEncoder().encode(config).write(to: paths.legacyConfig)
+        config.verifySSL = false
+        config.allowInsecureTransport = true
+        var legacyObject = try! JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(config)
+        ) as! [String: Any]
+        legacyObject.removeValue(forKey: "allow_insecure_transport")
+        try! JSONSerialization.data(withJSONObject: legacyObject).write(to: paths.legacyConfig)
+        var expectedConfig = config
+        expectedConfig.allowInsecureTransport = true
         var legacyState = AppState()
         legacyState.phase = "online"
+        legacyState.checking = true
         try! JSONEncoder().encode(legacyState).write(to: paths.legacyState)
 
         let store = AppStore(defaults: defaults, paths: paths)
-        precondition(store.config() == .success(config))
+        precondition(store.config() == .success(expectedConfig))
         precondition(defaults.data(forKey: configDefaultsKey) != nil)
-        try! store.saveConfig(config)
+        precondition(store.effectiveConfig() == .success(expectedConfig))
+        try! store.saveConfig(expectedConfig)
         store.saveState(legacyState)
         let reloaded = AppStore(defaults: defaults, paths: paths)
-        precondition(reloaded.config() == .success(config))
-        precondition(reloaded.loadState() == legacyState)
+        precondition(reloaded.config() == .success(expectedConfig))
+        var expectedState = legacyState
+        expectedState.checking = false
+        precondition(reloaded.loadState() == expectedState)
     }
 
     private static func engineCancellationAndMutex() {
@@ -1989,6 +2055,7 @@ enum SelfTest {
         engine.start()
         precondition(waiting.wait(timeout: .now() + 3) == .success)
         precondition(observed.get().phase == "waiting_ip")
+        precondition(observed.get().checking)
         let started = Date()
         engine.stop()
         precondition(Date().timeIntervalSince(started) < 1)

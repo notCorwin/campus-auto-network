@@ -10,8 +10,6 @@ APP_SOURCE="${APP_SOURCE:-$(pwd)/target/CampusAutoLogin.app}"
 APP_DEST="${APP_DEST:-$HOME/Applications/$APP_NAME.app}"
 APP_EXEC="$APP_DEST/Contents/MacOS/$APP_NAME"
 DATA_DIR="${DATA_DIR:-$HOME/Library/Application Support/csust-auto-login}"
-OLD_BINARY="${OLD_BINARY:-$HOME/.local/bin/csust-auto-login}"
-OLD_MONITOR="${OLD_MONITOR:-$HOME/.local/bin/csust-auto-login-monitor}"
 OLD_PLIST="${OLD_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
 
 ACTION="${1:-install}"
@@ -29,7 +27,7 @@ stop_old_service() {
 }
 
 app_pids() {
-  pgrep -f -x "$APP_EXEC" 2>/dev/null || true
+  ps -axo pid=,command= | awk '$2 ~ /\/CampusAutoLogin\.app\/Contents\/MacOS\/CampusAutoLogin$/ { print $1 }'
 }
 
 wait_for_pids() {
@@ -47,10 +45,14 @@ wait_for_pids() {
 }
 
 quit_app() {
+  local pids="$1"
   if [[ -x "$APP_EXEC" ]]; then
     "$APP_EXEC" --unregister >/dev/null 2>&1 || true
   fi
   osascript -e "tell application id \"$LABEL\" to quit" >/dev/null 2>&1 || true
+  for pid in $pids; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
 }
 
 switch_app() {
@@ -106,12 +108,12 @@ case "$ACTION" in
     ;;
   uninstall)
     stop_old_service
-    quit_app
     old_pids="$(app_pids)"
+    quit_app "$old_pids"
     wait_for_pids "$old_pids" || true
     rm -rf "$APP_DEST"
-    rm -f "$OLD_PLIST" "$OLD_BINARY" "$OLD_MONITOR"
-    echo "已卸载 App 和旧后台任务；配置与日志已保留。"
+    rm -f "$OLD_PLIST"
+    echo "已卸载 App 和旧登录启动配置；配置与日志已保留。"
     exit 0
     ;;
   install) ;;
@@ -138,19 +140,13 @@ cleanup() {
   local result=$?
   if [[ $result -ne 0 && "$SWITCH_STARTED" == true ]]; then
     echo "安装失败，恢复此前的 App 和后台配置..." >&2
-    quit_app
+    quit_app "$(app_pids)"
     local current_pids
     current_pids="$(app_pids)"
     wait_for_pids "$current_pids" || true
     rm -rf "$APP_DEST"
     if [[ -d "$PREVIOUS_APP" ]]; then
       mv "$PREVIOUS_APP" "$APP_DEST"
-    fi
-    if [[ -f "$STAGING_DIR/previous-binary" ]]; then
-      install -m 755 "$STAGING_DIR/previous-binary" "$OLD_BINARY"
-    fi
-    if [[ -f "$STAGING_DIR/previous-monitor" ]]; then
-      install -m 755 "$STAGING_DIR/previous-monitor" "$OLD_MONITOR"
     fi
     if [[ -f "$STAGING_DIR/previous.plist" ]]; then
       install -m 600 "$STAGING_DIR/previous.plist" "$OLD_PLIST"
@@ -173,18 +169,19 @@ ditto "$APP_SOURCE" "$NEW_APP"
 codesign --verify --deep --strict "$NEW_APP"
 EXPECTED_VERSION="$(plutil -extract CFBundleVersion raw -o - "$NEW_APP/Contents/Info.plist")"
 
-if [[ -f "$OLD_BINARY" ]]; then cp -p "$OLD_BINARY" "$STAGING_DIR/previous-binary"; fi
-if [[ -f "$OLD_MONITOR" ]]; then cp -p "$OLD_MONITOR" "$STAGING_DIR/previous-monitor"; fi
 if [[ -f "$OLD_PLIST" ]]; then cp -p "$OLD_PLIST" "$STAGING_DIR/previous.plist"; fi
 
-old_pids="$(app_pids)"
-quit_app
-wait_for_pids "$old_pids"
 stop_old_service
+old_pids="$(app_pids)"
+quit_app "$old_pids"
+wait_for_pids "$old_pids"
 
 # switch_app 在新副本移动失败时会先恢复旧副本；成功后才进入后续可恢复阶段。
 if ! switch_app "$NEW_APP" "$APP_DEST" "$PREVIOUS_APP"; then
   echo "无法切换 App，现有安装未改动。" >&2
+  if [[ "$PREVIOUS_LOADED" == true && -f "$OLD_PLIST" ]]; then
+    launchctl bootstrap "$DOMAIN" "$OLD_PLIST" || true
+  fi
   exit 1
 fi
 SWITCH_STARTED=true
@@ -208,8 +205,8 @@ if [[ -z "$new_pid" ]]; then
   exit 1
 fi
 
-rm -f "$OLD_PLIST" "$OLD_BINARY" "$OLD_MONITOR"
+rm -f "$OLD_PLIST"
 SWITCH_STARTED=false
-echo "安装完成（PID $new_pid，版本 $EXPECTED_VERSION）。App 已启动，网络事件触发、每 60 秒兜底检查一次。"
+echo "安装完成（PID ${new_pid}，版本 ${EXPECTED_VERSION}）。App 已启动，网络事件触发、每 60 秒兜底检查一次。"
 echo "配置：打开菜单栏的“校园网自动登录” → 设置…"
 echo "卸载：bash install.sh uninstall（配置与日志保留）"

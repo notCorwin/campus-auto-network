@@ -1,6 +1,6 @@
 # 校园网自动登录
 
-macOS 15+ 原生 Swift 菜单栏 App。首次启动申请定位权限，之后通过 CoreWLAN Wi‑Fi 事件、NWPathMonitor 和 60 秒兜底检查监测网络；只有精确匹配目标 SSID 且取得校园 IPv4 后才自动认证。
+macOS 13+ 原生 Swift 菜单栏 App。首次启动申请定位权限，之后通过 CoreWLAN Wi‑Fi 事件、NWPathMonitor 和 60 秒兜底检查监测网络；只有精确匹配目标 SSID 且取得校园 IPv4 后才自动认证。
 
 ## 安装与使用
 
@@ -9,6 +9,7 @@ bash install.sh
 ```
 
 App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注册登录时启动。首次运行会打开设置页；填写账号、密码、SSID、认证地址和连接方式后保存。
+安装器会先停止同 Bundle ID 的其他运行副本；日常请从 `~/Applications/CampusAutoLogin.app` 启动，避免打开旧下载副本。
 
 若系统没有弹出定位权限提示，在菜单栏 App 中点击“申请定位权限”，或打开：
 
@@ -20,7 +21,7 @@ App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注
 bash install.sh uninstall
 ```
 
-卸载只移除 App、旧 LaunchAgent 和旧 CLI，保留配置与日志。
+卸载只移除 App 和旧登录启动配置，保留配置与日志。
 
 ## 运行规则
 
@@ -47,13 +48,12 @@ plutil -lint Info.plist
 codesign --verify --deep --strict target/CampusAutoLogin.app
 ```
 
-`build.sh` 会编译 App、进行本机 ad-hoc 签名，并运行内置 self-test。`src/` 中的 Rust 实现保留作协议和迁移参考，不再参与 App 构建或后台运行。
+`build.sh` 会编译 App、进行本机 ad-hoc 签名，并运行内置 self-test。项目运行时只包含 Swift App，不再依赖旧 CLI 或后台守护进程。
 
 验证还包括 Swift 6 严格并发检查、配置迁移/持久化、权限与引擎取消、跨进程运行锁、直连/代理请求，以及安装替换回滚：
 
 ```sh
 bash install.sh self-test
-cargo test --all-targets
 ```
 
 每次推送会由 GitHub Actions 构建并更新 `autobuild` Release。更新器只接受
