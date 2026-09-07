@@ -13,9 +13,9 @@ import UserNotifications
 private let appDisplayName = "校园网自动登录"
 private let campusSSID = "CSUST-Student"
 private let campusLoginURL = URL(string: "https://login.csust.edu.cn:802/eportal/portal/login")!
+private let loginRequestTimeoutSecs: TimeInterval = 15
 private let configDefaultsKey = "config.v1"
 private let stateDefaultsKey = "state.v1"
-private let autoStartDefaultsKey = "autoStartEnabled"
 private let settingsWindowIdentifier = "com.nowaywastaken.csustautologin.settings"
 
 struct AppError: Error, LocalizedError, Sendable, Equatable {
@@ -27,41 +27,32 @@ struct AppError: Error, LocalizedError, Sendable, Equatable {
 struct AppConfig: Codable, Equatable, Sendable {
     var username: String
     var password: String
-    var timeoutSecs: UInt64
 
     static let `default` = AppConfig(
         username: "",
-        password: "",
-        timeoutSecs: 15
+        password: ""
     )
 
-    private enum CodingKeys: String, CodingKey {
-        case username, password
-        case timeoutSecs = "timeout_secs"
-    }
+    private enum CodingKeys: String, CodingKey { case username, password }
 
     init(
         username: String,
-        password: String,
-        timeoutSecs: UInt64
+        password: String
     ) {
         self.username = username
         self.password = password
-        self.timeoutSecs = timeoutSecs
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
         password = try container.decodeIfPresent(String.self, forKey: .password) ?? ""
-        timeoutSecs = try container.decodeIfPresent(UInt64.self, forKey: .timeoutSecs) ?? Self.default.timeoutSecs
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(username, forKey: .username)
         try container.encode(password, forKey: .password)
-        try container.encode(timeoutSecs, forKey: .timeoutSecs)
     }
 
     func validationError() -> String? {
@@ -69,9 +60,6 @@ struct AppConfig: Codable, Equatable, Sendable {
             return "账号或密码为空，请在设置中补充。"
         }
 
-        if !(1...3600).contains(timeoutSecs) {
-            return "单次超时须为 1–3600 秒。"
-        }
         return nil
     }
 }
@@ -292,22 +280,6 @@ final class AppStore: @unchecked Sendable {
         if let encoded = try? JSONEncoder().encode(state) {
             defaults.set(encoded, forKey: stateDefaultsKey)
         }
-    }
-
-    func autoStartEnabled() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if defaults.object(forKey: autoStartDefaultsKey) == nil {
-            defaults.set(true, forKey: autoStartDefaultsKey)
-            return true
-        }
-        return defaults.bool(forKey: autoStartDefaultsKey)
-    }
-
-    func setAutoStartEnabled(_ enabled: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        defaults.set(enabled, forKey: autoStartDefaultsKey)
     }
 
     enum StoreError: LocalizedError {
@@ -552,7 +524,6 @@ enum LoginService {
         ip: String,
         stillConnected: @escaping @Sendable () -> Bool,
         serverURL: URL = campusLoginURL,
-        verifyAccess: Bool = true,
         systemProxy: URL? = nil
     ) -> (AuthOutcome, String) {
         if let error = config.validationError() {
@@ -618,20 +589,7 @@ enum LoginService {
                 case .credentials:
                     return (.credentials, lastRoute)
                 case .online:
-                    guard verifyAccess else { return (.online, lastRoute) }
-                    switch verifyConnectivity(
-                        config: config,
-                        serverURL: serverURL,
-                        route: route,
-                        shouldContinue: stillConnected,
-                        systemProxy: systemProxy
-                    ) {
-                    case .success:
-                        return (.online, lastRoute)
-                    case .failure(let error):
-                        if !stillConnected() { return (.networkChanged, lastRoute) }
-                        errors.append("\(routeLabel(route))：\(error.message)")
-                    }
+                    return (.online, lastRoute)
                 case .retry(let detail):
                     errors.append("\(routeLabel(route))：\(detail)")
                 case .networkChanged:
@@ -666,45 +624,6 @@ enum LoginService {
         }
     }
 
-    private static func verifyConnectivity(
-        config: AppConfig,
-        serverURL: URL,
-        route: String,
-        shouldContinue: @escaping @Sendable () -> Bool,
-        systemProxy: URL?
-    ) -> Result<Void, AppError> {
-        guard let loginURL = originURL(serverURL) else {
-            return .failure(AppError(message: "无法访问 login.csust.edu.cn"))
-        }
-        let probes: [(String, URL, Int?)] = [
-            ("login.csust.edu.cn", loginURL, nil),
-            ("Cloudflare", URL(string: "https://www.cloudflare.com/cdn-cgi/trace")!, nil),
-            ("Google", URL(string: "https://www.google.com/generate_204")!, 204)
-        ]
-        for (name, url, expectedStatus) in probes {
-            guard shouldContinue() else {
-                return .failure(AppError(message: "网络已变化"))
-            }
-            let request = makeRequest(url: url, parameters: [], referer: loginURL.absoluteString)
-                ?? URLRequest(url: url)
-            switch perform(
-                request: request,
-                config: config,
-                route: route,
-                shouldContinue: shouldContinue,
-                systemProxy: systemProxy
-            ) {
-            case .failure(let error):
-                return .failure(AppError(message: "\(name)验证失败：\(error.message)"))
-            case .success(let response):
-                guard expectedStatus.map({ response.statusCode == $0 }) ?? (200...299).contains(response.statusCode) else {
-                    return .failure(AppError(message: "\(name)返回 HTTP \(response.statusCode)"))
-                }
-            }
-        }
-        return .success(())
-    }
-
     private static func makeRequest(
         url: URL,
         parameters: [(String, String)],
@@ -730,8 +649,8 @@ enum LoginService {
     ) -> Result<HTTPResult, AppError> {
         let sessionConfiguration = URLSessionConfiguration.ephemeral
         sessionConfiguration.waitsForConnectivity = false
-        sessionConfiguration.timeoutIntervalForRequest = Double(config.timeoutSecs)
-        sessionConfiguration.timeoutIntervalForResource = Double(config.timeoutSecs)
+        sessionConfiguration.timeoutIntervalForRequest = loginRequestTimeoutSecs
+        sessionConfiguration.timeoutIntervalForResource = loginRequestTimeoutSecs
         sessionConfiguration.httpShouldSetCookies = false
         if route == "direct" {
             sessionConfiguration.connectionProxyDictionary = [
@@ -769,7 +688,7 @@ enum LoginService {
             semaphore.signal()
         }
         task.resume()
-        let deadline = Date().addingTimeInterval(Double(config.timeoutSecs) + 1)
+        let deadline = Date().addingTimeInterval(loginRequestTimeoutSecs + 1)
         while semaphore.wait(timeout: .now() + .milliseconds(100)) == .timedOut {
             if !shouldContinue() {
                 task.cancel()
@@ -879,7 +798,7 @@ func configFingerprint(_ config: AppConfig) -> String {
     let passwordDigest = SHA256.hash(data: Data(config.password.utf8))
         .map { String(format: "%02x", $0) }
         .joined()
-    let material = "\(config.username)\u{0}\(config.timeoutSecs)\u{0}\(passwordDigest)"
+    let material = "\(config.username)\u{0}\(passwordDigest)"
     return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
@@ -1119,7 +1038,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     @Published private(set) var networks: [WiFiNetwork] = []
     @Published private(set) var diagnosticText = ""
     @Published private(set) var launchStatus = ""
-    @Published private(set) var autoStartEnabled: Bool
     @Published private(set) var updateStatus = AppUpdateStatus.idle
 
     private let store: AppStore
@@ -1161,7 +1079,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
         state = store.loadState()
         permissionStatus = locationManager.authorizationStatus
-        autoStartEnabled = store.autoStartEnabled()
         super.init()
         locationManager.delegate = self
     }
@@ -1173,7 +1090,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         state.detail = ""
         requestNotificationPermission()
         refreshLaunchStatus()
-        if autoStartEnabled { registerLaunchAtLogin() }
+        registerLaunchAtLogin()
 
         wifiMonitor.onChange = { [weak self] in
             Task { @MainActor [weak self] in self?.requestCheck() }
@@ -1288,23 +1205,6 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         }
     }
 
-    func setAutoStart(_ enabled: Bool) {
-        do {
-            if enabled {
-                try SMAppService.mainApp.register()
-            } else {
-                try SMAppService.mainApp.unregister()
-            }
-            autoStartEnabled = enabled
-            store.setAutoStartEnabled(enabled)
-            diagnosticText = enabled ? "已启用登录时自动启动。" : "已关闭登录时自动启动。"
-            refreshLaunchStatus()
-        } catch {
-            diagnosticText = "登录启动设置失败：\(error.localizedDescription)"
-            refreshLaunchStatus()
-        }
-    }
-
     func menuDidOpen() {
         checkForUpdates(silently: true)
     }
@@ -1410,9 +1310,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     }
 
     var statusEmoji: String {
-        permissionStatus == .authorized && !state.checking && state.phase == "online"
-            ? "🛰️"
-            : "💥"
+        "🛰️"
     }
 
     private func apply(state: AppState, shouldNotify: Bool) {
@@ -1555,10 +1453,6 @@ struct MenuContent: View {
             Button("打开定位设置") { model.openLocationSettings() }
         }
         Divider()
-        Toggle("登录时自动启动", isOn: Binding(
-            get: { model.autoStartEnabled },
-            set: { model.setAutoStart($0) }
-        ))
         Text("启动：\(model.launchStatus)")
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -1573,14 +1467,12 @@ struct MenuContent: View {
 struct SettingsView: View {
     @ObservedObject var model: AppModel
     @State private var draft: AppConfig
-    @State private var timeoutText: String
     @State private var message = ""
 
     init(model: AppModel) {
         self.model = model
         let config = model.config
         _draft = State(initialValue: config)
-        _timeoutText = State(initialValue: String(config.timeoutSecs))
     }
 
     var body: some View {
@@ -1594,22 +1486,14 @@ struct SettingsView: View {
             }
             Section("连接方式") {
                 Text("自动适配 macOS 系统代理/PAC：先直连，失败后使用系统代理。")
-                Text("认证成功后还会验证 login.csust.edu.cn、Cloudflare 和 Google 的联网标志。")
+                Text("认证地址请求成功且系统网络路径可用即视为登录成功，不发送 204 探测请求。")
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            Section("请求") {
-                TextField("单次超时（秒）", text: $timeoutText)
             }
             Section {
                 HStack {
                     Button("保存") { save() }
                     Button("立即检查") { model.checkNow() }
                     Button("诊断") { model.runDoctor() }
-                    Spacer()
-                    Toggle("登录时自动启动", isOn: Binding(
-                        get: { model.autoStartEnabled },
-                        set: { model.setAutoStart($0) }
-                    ))
                 }
                 if !message.isEmpty {
                     Text(message).foregroundStyle(.secondary)
@@ -1630,15 +1514,9 @@ struct SettingsView: View {
 
     private func reload() {
         draft = model.config
-        timeoutText = String(draft.timeoutSecs)
     }
 
     private func save() {
-        guard let timeout = UInt64(timeoutText) else {
-            message = "超时必须是数字。"
-            return
-        }
-        draft.timeoutSecs = timeout
         guard let error = draft.validationError() else {
             model.saveConfig(draft)
             message = "配置已保存。"
@@ -1687,7 +1565,7 @@ struct MenuBarLabel: View {
 
     var body: some View {
         Text(model.statusEmoji)
-            .accessibilityLabel(model.statusEmoji == "🛰️" ? "校园网已连接" : "校园网未连接")
+            .accessibilityLabel("校园网自动登录")
     }
 }
 
@@ -1806,8 +1684,7 @@ enum SelfTest {
         precondition(usableIPv4("10.183.0.2"))
         let config = AppConfig(
             username: "account",
-            password: "p&密+?#",
-            timeoutSecs: 1
+            password: "p&密+?#"
         )
         precondition(selectNetwork([
             WiFiNetwork(interfaceName: "en0", ssid: "other", bssid: nil, ip: "10.183.0.2"),
@@ -1822,6 +1699,7 @@ enum SelfTest {
         precondition(config.validationError() == nil)
         let encodedConfig = try! JSONEncoder().encode(config)
         precondition(String(decoding: encodedConfig, as: UTF8.self).contains(config.password))
+        precondition(!String(decoding: encodedConfig, as: UTF8.self).contains("timeout"))
         var changedConfig = config
         changedConfig.password = "different"
         precondition(configFingerprint(config) != configFingerprint(changedConfig))
@@ -1900,8 +1778,7 @@ enum SelfTest {
         try! legacyConfig.write(to: paths.legacyConfig)
         let expectedConfig = AppConfig(
             username: "migrated-account",
-            password: "migrated-password",
-            timeoutSecs: 15
+            password: "migrated-password"
         )
         var legacyState = AppState()
         legacyState.phase = "online"
@@ -2055,7 +1932,6 @@ enum SelfTest {
             ip: "10.183.0.2",
             stillConnected: { true },
             serverURL: serverURL,
-            verifyAccess: false,
             systemProxy: systemProxy
         )
         precondition(result.0 == .online)

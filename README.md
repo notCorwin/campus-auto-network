@@ -8,14 +8,14 @@ macOS 13+ 原生 Swift 菜单栏 App。首次启动申请定位权限，之后�
 bash install.sh
 ```
 
-App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注册登录时启动。首次运行会打开设置页；填写账号、密码和请求超时后保存。
+App 安装到 `~/Applications/CampusAutoLogin.app`，安装后自动启动并注册登录时启动。首次运行会打开设置页；填写账号和密码后保存。
 安装器会先停止同 Bundle ID 的其他运行副本；日常请从 `~/Applications/CampusAutoLogin.app` 启动，避免打开旧下载副本。
 
 若系统没有弹出定位权限提示，在菜单栏 App 中点击“申请定位权限”，或打开：
 
 `系统设置 → 隐私与安全性 → 定位服务 → 系统服务 → 网络与无线`
 
-菜单栏提供立即检查、诊断、设置、更新、登录时自动启动和退出。更新状态会在打开菜单时及每 3 分钟自动检查；后台发现新版本后会自动下载、校验并安装，手动检查仍可在确认后安装。卸载：
+菜单栏提供立即检查、诊断、设置、更新和退出；App 始终注册登录时自动启动。更新状态会在打开菜单时及每 3 分钟自动检查；后台发现新版本后会自动下载、校验并安装，手动检查仍可在确认后安装。卸载：
 
 ```sh
 bash install.sh uninstall
@@ -30,10 +30,10 @@ bash install.sh uninstall
 - CoreWLAN 和 NWPathMonitor 都使用系统事件；校园网仍连接但互联网路径失效时暂停请求，路径恢复事件到达后立即重新认证。
 - 先直连；直连失败后由 `URLSession` 使用 macOS 系统代理/PAC，兼容有无代理的机器。
 - 认证地址固定为 `https://login.csust.edu.cn:802/eportal/portal/login`，使用系统 TLS 证书校验，避免可配置地址带来的误认证风险。
-- 认证响应成功后还必须满足：可访问 `login.csust.edu.cn`、Cloudflare trace 返回 2xx、Google `generate_204` 返回 204。
+- 认证请求成功且 `NWPathMonitor` 报告互联网路径可用即视为登录成功；不发送 Cloudflare、Google 或 `204` 探测请求。
 - 每次请求前后重新确认网络；切换 SSID、接口或 IPv4 会停止当前认证轮次。
 - 认证失败会在收到结果后立即重试直到成功；账号密码错误立即暂停自动尝试，修改配置或点击立即检查后恢复。
-- 账号、密码、请求超时、运行状态和自动启动设置全部写入 UserDefaults，不使用 Keychain。
+- 账号、密码和运行状态写入 UserDefaults，不使用 Keychain；请求超时和网络规则固定在代码中。
 
 ## 配置迁移
 
