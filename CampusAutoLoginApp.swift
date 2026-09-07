@@ -1135,6 +1135,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     private var isCheckingForUpdate = false
     private var isInstallingUpdate = false
     private var manualCheckRequested = false
+    private var settingsWindowOpening = false
 
     private lazy var engine: AutoLoginEngine = {
         AutoLoginEngine(
@@ -1485,6 +1486,7 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
 
     func restoreBackgroundActivationIfNeeded() {
         guard permissionStatus == .authorized else { return }
+        guard !settingsWindowOpening else { return }
         let settingsWindowIsVisible = NSApp.windows.contains {
             $0.isVisible && $0.identifier?.rawValue == settingsWindowIdentifier
         }
@@ -1492,13 +1494,24 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
         NSApp.setActivationPolicy(.accessory)
     }
 
-    func openSettingsWindow() {
+    func prepareSettingsWindow() {
+        settingsWindowOpening = true
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func openSettingsWindow() {
+        prepareSettingsWindow()
         if !NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil) {
+            settingsWindowOpening = false
             restoreBackgroundActivationIfNeeded()
             diagnosticText = "无法打开设置窗口，请从菜单栏重新打开“设置…”。"
         }
+    }
+
+    func settingsWindowDidAppear() {
+        settingsWindowOpening = false
+        NSApp.setActivationPolicy(.regular)
     }
 
     func quit() {
@@ -1533,9 +1546,7 @@ struct MenuContent: View {
         Button("立即检查") { model.checkNow() }
         Button("诊断") { model.runDoctor() }
         if #available(macOS 14.0, *) {
-            SettingsLink {
-                Text("设置…")
-            }
+            NativeSettingsButton(model: model)
         } else {
             Button("设置…") { model.openSettingsWindow() }
         }
@@ -1645,13 +1656,29 @@ private struct SettingsWindowConfiguration: NSViewRepresentable {
     func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
+@MainActor
 private final class SettingsWindowProbe: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
         window.identifier = NSUserInterfaceItemIdentifier(settingsWindowIdentifier)
         window.collectionBehavior = [.managed, .primary]
-        NSApp.setActivationPolicy(.regular)
+        AppModel.shared.settingsWindowDidAppear()
+    }
+}
+
+@available(macOS 14.0, *)
+private struct NativeSettingsButton: View {
+    @Environment(\.openSettings) private var openSettings
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button("设置…") {
+            model.prepareSettingsWindow()
+            DispatchQueue.main.async {
+                openSettings()
+            }
+        }
     }
 }
 
