@@ -1374,16 +1374,11 @@ final class AppModel: NSObject, ObservableObject, @preconcurrency CLLocationMana
     func handleAuthorizationChange() {
         permissionStatus = locationManager.authorizationStatus
         refreshNetworks()
-        if permissionStatus == .authorized {
-            restoreBackgroundActivationIfNeeded()
-            requestCheck()
-        } else {
-            requestCheck()
-        }
+        restoreBackgroundActivationIfNeeded()
+        requestCheck()
     }
 
     func restoreBackgroundActivationIfNeeded() {
-        guard permissionStatus == .authorized else { return }
         guard !settingsWindowOpening else { return }
         let settingsWindowIsVisible = NSApp.windows.contains {
             $0.isVisible && $0.identifier?.rawValue == settingsWindowIdentifier
